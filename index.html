@@ -271,8 +271,9 @@ function makeNumberSpriteTexture(num, color) {
   tex.encoding = THREE.sRGBEncoding;
   return tex;
 }
-const DIGIT_GIVEN_MATS = {};
-const DIGIT_USER_MATS  = {};
+const DIGIT_GIVEN_MATS    = {};
+const DIGIT_USER_MATS     = {};
+const DIGIT_CONFLICT_MATS = {};
 for (let n = 1; n <= 9; n++) {
   DIGIT_GIVEN_MATS[n] = new THREE.MeshBasicMaterial({
     map: makeNumberSpriteTexture(n, '#fff2c8'), transparent: true, depthWrite: false,
@@ -280,12 +281,21 @@ for (let n = 1; n <= 9; n++) {
   DIGIT_USER_MATS[n] = new THREE.MeshBasicMaterial({
     map: makeNumberSpriteTexture(n, '#bfe0ff'), transparent: true, depthWrite: false,
   });
+  DIGIT_CONFLICT_MATS[n] = new THREE.MeshBasicMaterial({
+    map: makeNumberSpriteTexture(n, '#ff7066'), transparent: true, depthWrite: false,
+  });
 }
 const _unitDigitGeom = new THREE.PlaneGeometry(1, 1);
 keepAlive(_unitDigitGeom);
 for (let n = 1; n <= 9; n++) {
-  keepAlive(DIGIT_GIVEN_MATS[n], DIGIT_GIVEN_MATS[n].map);
-  keepAlive(DIGIT_USER_MATS[n],  DIGIT_USER_MATS[n].map);
+  keepAlive(DIGIT_GIVEN_MATS[n],    DIGIT_GIVEN_MATS[n].map);
+  keepAlive(DIGIT_USER_MATS[n],     DIGIT_USER_MATS[n].map);
+  keepAlive(DIGIT_CONFLICT_MATS[n], DIGIT_CONFLICT_MATS[n].map);
+}
+
+function _pickDigitMatSet(isGiven, isConflict) {
+  if (isConflict) return DIGIT_CONFLICT_MATS;
+  return isGiven ? DIGIT_GIVEN_MATS : DIGIT_USER_MATS;
 }
 
 // Make a digit plane mesh (size in world units). `value` is 1..9; isGiven picks color.
@@ -317,19 +327,54 @@ function fitDigitSize(pts, frac = 0.85) {
 // Each polyhedral piece carries: { value, isGiven, digit, digitLocal:{x,y,size} }.
 // Attach a digit plane at (x, y) local to the piece, lifted just above the face.
 const _DIGIT_LIFT = 0.012;
-function setPieceDigit(piece, value, isGiven) {
+function setPieceDigit(piece, value, isGiven, isConflict = false) {
   if (piece.userData.digit) {
     piece.remove(piece.userData.digit);
     piece.userData.digit = null;
   }
-  piece.userData.value   = value;
-  piece.userData.isGiven = isGiven;
+  piece.userData.value      = value;
+  piece.userData.isGiven    = isGiven;
+  piece.userData.isConflict = isConflict;
   if (value === 0 || value == null) return;
   const { x, y, size } = piece.userData.digitLocal;
-  const m = makeDigitPlane(value, isGiven, size);
+  const matSet = _pickDigitMatSet(isGiven, isConflict);
+  const m = new THREE.Mesh(_unitDigitGeom, matSet[value]);
+  m.scale.set(size, size, 1);
+  m.renderOrder = 3;
   m.position.set(x, y, _DIGIT_LIFT);
   piece.add(m);
   piece.userData.digit = m;
+}
+
+// Per-face uniqueness check for polyhedral shapes (megaminx, icosaminx).
+// Rule: no duplicate non-zero digit among the pieces lying on the same face.
+// Givens stay styled as given even when conflicting; only user entries paint red.
+function validatePolyhedralFaces(pieces) {
+  const byFace = new Map();
+  for (const p of pieces) {
+    const f = p.userData.face;
+    if (!byFace.has(f)) byFace.set(f, []);
+    byFace.get(f).push(p);
+  }
+  const conflicts = new Set();
+  for (const list of byFace.values()) {
+    const seen = new Map();
+    for (const p of list) {
+      const v = p.userData.value;
+      if (!v) continue;
+      if (!seen.has(v)) seen.set(v, []);
+      seen.get(v).push(p);
+    }
+    for (const dups of seen.values()) {
+      if (dups.length > 1) for (const p of dups) conflicts.add(p);
+    }
+  }
+  for (const p of pieces) {
+    const shouldFlag = !p.userData.isGiven && p.userData.value !== 0 && conflicts.has(p);
+    if (!!p.userData.isConflict !== shouldFlag) {
+      setPieceDigit(p, p.userData.value, p.userData.isGiven, shouldFlag);
+    }
+  }
 }
 
 // Per-frame: rotate every piece's digit plane so its +Y aligns with the
@@ -423,8 +468,9 @@ const SHAPES = []; // populated after all shape factories defined
 // ============================================================================
 //  SHAPE 1 — SUDOKU CUBE  (9×9×9 shell, digits, flip, arrow-move)
 // ============================================================================
-function makeCubeShape() {
-  const N = 9;
+function makeCubeShape(N = 9) {
+  const blockSize = Math.round(Math.sqrt(N));
+  if (blockSize * blockSize !== N) throw new Error('makeCubeShape: N must be a perfect square');
   const cubeSize = 1;
 
   let group = null;
@@ -436,7 +482,8 @@ function makeCubeShape() {
   let highlightInner = null, highlightOuter = null;
   let _t = 0;
   let rotX = 0, rotY = 0, targetRotX = 0, targetRotY = 0;
-  let zoom = 28;
+  const DEFAULT_ZOOM = N * 3.2;
+  let zoom = DEFAULT_ZOOM;
 
   // --- rounded box geometry (smoothed corners) ---
   function smoothCoincidentNormals(geometry, tolerance = 1e-4) {
@@ -489,8 +536,8 @@ function makeCubeShape() {
     f.upCandidates = f.quats.map(q => new THREE.Vector3(0, 1, 0).applyQuaternion(q));
     f.quat = f.quats[0];
   }
-  function makeDigitPlaneForCubeFace(value, isGiven, face) {
-    const mat = (isGiven ? DIGIT_GIVEN_MATS : DIGIT_USER_MATS)[value];
+  function makeDigitPlaneForCubeFace(value, isGiven, face, isConflict = false) {
+    const mat = _pickDigitMatSet(isGiven, isConflict)[value];
     const m = new THREE.Mesh(_unitDigitGeom, mat);
     m.scale.set(PLANE_SIZE, PLANE_SIZE, 1);
     m.renderOrder = 2;
@@ -498,6 +545,17 @@ function makeCubeShape() {
     m.quaternion.copy(face.quat);
     m.userData.face = face;
     return m;
+  }
+  function rebuildCubePlanes(cube) {
+    for (const pl of cube.userData.planes) cube.remove(pl);
+    cube.userData.planes.length = 0;
+    const { value, isGiven, isConflict, faces } = cube.userData;
+    if (value === 0) return;
+    for (const f of faces) {
+      const pl = makeDigitPlaneForCubeFace(value, isGiven, f, !!isConflict);
+      cube.add(pl);
+      cube.userData.planes.push(pl);
+    }
   }
   function outerFacesFor(i, j, k) {
     const out = [];
@@ -510,11 +568,11 @@ function makeCubeShape() {
     return out;
   }
   function blockColor(i, j, k) {
-    const bi = Math.floor(i / 3), bj = Math.floor(j / 3), bk = Math.floor(k / 3);
-    const hueBases = [200, 258, 318];
-    const hue = hueBases[bi] + bk * 14;
+    const bi = Math.floor(i / blockSize), bj = Math.floor(j / blockSize), bk = Math.floor(k / blockSize);
+    const hueStep = 360 / blockSize;
+    const hue = 200 + bi * hueStep + bk * 14;
     const sat = 0.32 + bk * 0.09;
-    const lit = 0.55 + (bj - 1) * 0.07;
+    const lit = 0.55 + (bj - (blockSize - 1) / 2) * 0.07;
     return new THREE.Color().setHSL(((hue % 360) + 360) % 360 / 360, sat, lit);
   }
 
@@ -534,14 +592,14 @@ function makeCubeShape() {
     givenCount = 0;
     userEntries = 0;
     rotX = rotY = targetRotX = targetRotY = 0;
-    zoom = 28;
+    zoom = DEFAULT_ZOOM;
 
     for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) for (let k = 0; k < N; k++) {
       const isShell = (i === 0 || i === N - 1 || j === 0 || j === N - 1 || k === 0 || k === N - 1);
       if (!isShell) continue;
       const baseColor = blockColor(i, j, k);
       const isGiven = Math.random() < GIVEN_PROBABILITY;
-      const value   = isGiven ? Math.floor(Math.random() * 9) + 1 : 0;
+      const value   = isGiven ? Math.floor(Math.random() * N) + 1 : 0;
       if (isGiven) givenCount++;
 
       const mat = new THREE.MeshStandardMaterial({ color: baseColor, metalness: 0.08, roughness: 0.42 });
@@ -577,17 +635,56 @@ function makeCubeShape() {
     if (!cube || cube.userData.isGiven) return;
     const prev = cube.userData.value;
     cube.userData.value = value;
-    for (const pl of cube.userData.planes) cube.remove(pl);
-    cube.userData.planes.length = 0;
-    if (value !== 0) for (const f of cube.userData.faces) {
-      const pl = makeDigitPlaneForCubeFace(value, false, f);
-      cube.add(pl);
-      cube.userData.planes.push(pl);
-    }
+    cube.userData.isConflict = false;
+    rebuildCubePlanes(cube);
     if (prev === 0 && value !== 0) userEntries++;
     else if (prev !== 0 && value === 0) userEntries--;
+    validate();
     if (cube === selectedCube) refreshSelected();
     statsEl.innerHTML = api.statsHTML();
+  }
+
+  // Each face of the cube is an N×N sudoku board: rows, cols, and √N-sized
+  // sub-boxes must each contain 1..N at most once. A cubie that violates any
+  // constraint on any of its faces is flagged; non-given conflicts paint red.
+  function validate() {
+    const conflicts = new Set();
+    for (const f of FACE_DIRS) {
+      const axis = f.axis;
+      const fixed = f.sign > 0 ? N - 1 : 0;
+      const cells = [];
+      for (let u = 0; u < N; u++) for (let v = 0; v < N; v++) {
+        let i, j, k;
+        if      (axis === 'x') { i = fixed; j = u;     k = v; }
+        else if (axis === 'y') { i = u;     j = fixed; k = v; }
+        else                   { i = u;     j = v;     k = fixed; }
+        const cube = grid[i][j][k];
+        if (cube) cells.push({ u, v, cube, value: cube.userData.value });
+      }
+      const flag = arr => {
+        const seen = new Map();
+        for (const c of arr) {
+          if (c.value === 0) continue;
+          if (!seen.has(c.value)) seen.set(c.value, []);
+          seen.get(c.value).push(c);
+        }
+        for (const list of seen.values()) {
+          if (list.length > 1) for (const c of list) conflicts.add(c.cube);
+        }
+      };
+      for (let u = 0; u < N; u++) flag(cells.filter(c => c.u === u));
+      for (let v = 0; v < N; v++) flag(cells.filter(c => c.v === v));
+      for (let bu = 0; bu < blockSize; bu++)
+        for (let bv = 0; bv < blockSize; bv++)
+          flag(cells.filter(c => Math.floor(c.u / blockSize) === bu && Math.floor(c.v / blockSize) === bv));
+    }
+    for (const c of allCubes) {
+      const shouldFlag = !c.userData.isGiven && c.userData.value !== 0 && conflicts.has(c);
+      if (!!c.userData.isConflict !== shouldFlag) {
+        c.userData.isConflict = shouldFlag;
+        rebuildCubePlanes(c);
+      }
+    }
   }
 
   function flip(axis, dir) {
@@ -626,18 +723,20 @@ function makeCubeShape() {
     refreshSelected();
   }
 
+  const totalCells = N * N * N - Math.max(0, (N - 2)) ** 3;
   const api = {
-    name: 'Sudoku Cube',
-    subtitle: 'A 729-cell puzzle living in three dimensions (shell only).',
+    name: N === 9 ? 'Sudoku Cube' : `Sudoku Cube ${N}×${N}×${N}`,
+    subtitle: `A ${totalCells}-cell puzzle living in three dimensions (shell only). Digits 1–${N}.`,
     controlsHTML:
-      `<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>` +
+      `<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>${N}</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>` +
       `<kbd>right-drag</kbd> rotate &nbsp; <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> flip face<br>` +
       `<kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> move &nbsp; <kbd>⇧</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> Z-axis &nbsp; <kbd>scroll</kbd> zoom`,
-    cameraDistance: 28,
+    cameraDistance: DEFAULT_ZOOM,
     drivesCamera: true, // cube manages its own zoom
 
     install() {
       build();
+      validate();
       scene.add(group);
     },
     uninstall() {
@@ -684,8 +783,9 @@ function makeCubeShape() {
              `<span class="dim">Value</span> ${v}`;
     },
     statsHTML() {
+      const subBlocks = blockSize * blockSize * blockSize;
       return `<span class="dim">cells</span> <span class="stat-num">${allCubes ? allCubes.length : 0}</span><br>` +
-             `<span class="dim">sub-blocks</span> <span class="stat-num">27</span><br>` +
+             `<span class="dim">sub-blocks</span> <span class="stat-num">${subBlocks}</span><br>` +
              `<span class="dim">given clues</span> <span class="stat-num">${givenCount}</span><br>` +
              `<span class="dim">your entries</span> <span class="stat-num">${userEntries}</span>`;
     },
@@ -707,7 +807,12 @@ function makeCubeShape() {
       if (k === 'ArrowDown')  { e.shiftKey ? arrowMove(0,0, 1) : arrowMove(0,-1,0); e.preventDefault(); return true; }
       if (k === 'ArrowLeft')  { arrowMove(-1,0,0); e.preventDefault(); return true; }
       if (k === 'ArrowRight') { arrowMove( 1,0,0); e.preventDefault(); return true; }
-      if (k >= '1' && k <= '9') { setCellValue(selectedCube, parseInt(k)); e.preventDefault(); return true; }
+      if (k >= '1' && k <= '9') {
+        const v = parseInt(k);
+        if (v <= N) setCellValue(selectedCube, v);
+        e.preventDefault();
+        return true;
+      }
       if (k === '0' || k === 'Backspace' || k === 'Delete') { setCellValue(selectedCube, 0); e.preventDefault(); return true; }
       return false;
     },
@@ -1129,7 +1234,7 @@ function makeMinxLikeShape(opts) {
       '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
       '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
     cameraDistance: 9,
-    install() { build(); scene.add(group); },
+    install() { build(); validatePolyhedralFaces(pieces); scene.add(group); },
     uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; },
     get pickables() { return pieces; },
     pick(hit) {
@@ -1160,6 +1265,7 @@ function makeMinxLikeShape(opts) {
           for (const sib of piece.userData.siblings) setPieceDigit(sib, value, false);
           if (prev === 0 && value !== 0) userEntries++;
           else if (prev !== 0 && value === 0) userEntries--;
+          validatePolyhedralFaces(pieces);
           refreshSelected();
           statsEl.innerHTML = api.statsHTML();
         },
@@ -1198,9 +1304,10 @@ function makeMinxLikeShape(opts) {
 // ============================================================================
 //  REGISTER ALL SHAPES
 // ============================================================================
-SHAPES.push(makeCubeShape());
+SHAPES.push(makeCubeShape(4));
+SHAPES.push(makeCubeShape(9));
 
-SHAPES.push(makeKilominxShape());
+// SHAPES.push(makeKilominxShape()); // hidden
 
 SHAPES.push(makeMinxLikeShape({
   name: 'Sudoku Megaminx',
