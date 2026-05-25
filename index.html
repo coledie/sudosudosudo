@@ -117,6 +117,11 @@ const fillLight = new THREE.DirectionalLight(0xffb8d0, 0.25); fillLight.position
 // Every shape gets its own root group attached/detached on switch.
 let activeShape = null;
 
+// Resources tagged with keepAlive() survive `disposeGroup` (shared across
+// shape switches: digit textures, the unit digit plane, outline/highlight mats).
+const DISPOSE_BLACKLIST = new WeakSet();
+function keepAlive(...resources) { for (const r of resources) DISPOSE_BLACKLIST.add(r); }
+
 const infoBodyEl = document.getElementById('infoBody');
 const statsEl    = document.getElementById('stats');
 const selectedEl = document.getElementById('selected');
@@ -222,19 +227,150 @@ const POLY_OUTLINE_MAT = new THREE.MeshBasicMaterial({
   polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
 });
 const POLY_HL_MAT = new THREE.LineBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.95 });
+keepAlive(POLY_OUTLINE_MAT, POLY_HL_MAT);
 
 // Dispose all materials/geometries reachable from a group (best-effort).
+// Resources registered via keepAlive() are shared across shape switches and
+// must survive an uninstall (digit textures, the unit digit plane geom,
+// the shared outline/highlight materials, etc.).
 function disposeGroup(group) {
   group.traverse(obj => {
-    if (obj.geometry) obj.geometry.dispose();
+    if (obj.geometry && !DISPOSE_BLACKLIST.has(obj.geometry)) obj.geometry.dispose();
     if (obj.material) {
       const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
       for (const m of mats) {
-        if (m.map) m.map.dispose();
+        if (DISPOSE_BLACKLIST.has(m)) continue;
+        if (m.map && !DISPOSE_BLACKLIST.has(m.map)) m.map.dispose();
         m.dispose();
       }
     }
   });
+}
+
+// ============================================================================
+//  SHARED DIGIT MODULE  (used by every shape)
+//  Generates 1-9 sprite textures once, exposes plane materials + a builder
+//  helper, plus a per-frame "rotate digits to face camera-up" utility.
+// ============================================================================
+const GIVEN_PROBABILITY = 0.30;
+
+function makeNumberSpriteTexture(num, color) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d');
+  g.shadowColor = 'rgba(0, 0, 0, 0.55)';
+  g.shadowBlur = 8;
+  g.shadowOffsetY = 2;
+  g.fillStyle = color;
+  g.font = '800 96px "SF Pro Display", -apple-system, system-ui, "Helvetica Neue", Arial, sans-serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText(String(num), 64, 70);
+  const tex = new THREE.CanvasTexture(c);
+  tex.anisotropy = 8;
+  tex.encoding = THREE.sRGBEncoding;
+  return tex;
+}
+const DIGIT_GIVEN_MATS = {};
+const DIGIT_USER_MATS  = {};
+for (let n = 1; n <= 9; n++) {
+  DIGIT_GIVEN_MATS[n] = new THREE.MeshBasicMaterial({
+    map: makeNumberSpriteTexture(n, '#fff2c8'), transparent: true, depthWrite: false,
+  });
+  DIGIT_USER_MATS[n] = new THREE.MeshBasicMaterial({
+    map: makeNumberSpriteTexture(n, '#bfe0ff'), transparent: true, depthWrite: false,
+  });
+}
+const _unitDigitGeom = new THREE.PlaneGeometry(1, 1);
+keepAlive(_unitDigitGeom);
+for (let n = 1; n <= 9; n++) {
+  keepAlive(DIGIT_GIVEN_MATS[n], DIGIT_GIVEN_MATS[n].map);
+  keepAlive(DIGIT_USER_MATS[n],  DIGIT_USER_MATS[n].map);
+}
+
+// Make a digit plane mesh (size in world units). `value` is 1..9; isGiven picks color.
+function makeDigitPlane(value, isGiven, size) {
+  const mat = (isGiven ? DIGIT_GIVEN_MATS : DIGIT_USER_MATS)[value];
+  const m = new THREE.Mesh(_unitDigitGeom, mat);
+  m.scale.set(size, size, 1);
+  m.renderOrder = 3;
+  return m;
+}
+
+// ---- helpers for the polyhedral shapes (digit attached at template 2D centroid) ----
+function centroidOf2D(pts) {
+  let cx = 0, cy = 0;
+  for (const p of pts) { cx += p[0]; cy += p[1]; }
+  return [cx / pts.length, cy / pts.length];
+}
+// Returns an inscribed plane size based on min distance from centroid to any vertex.
+function fitDigitSize(pts, frac = 0.85) {
+  const [cx, cy] = centroidOf2D(pts);
+  let minR = Infinity;
+  for (const p of pts) {
+    const r = Math.hypot(p[0] - cx, p[1] - cy);
+    if (r < minR) minR = r;
+  }
+  return minR * frac;
+}
+
+// Each polyhedral piece carries: { value, isGiven, digit, digitLocal:{x,y,size} }.
+// Attach a digit plane at (x, y) local to the piece, lifted just above the face.
+const _DIGIT_LIFT = 0.012;
+function setPieceDigit(piece, value, isGiven) {
+  if (piece.userData.digit) {
+    piece.remove(piece.userData.digit);
+    piece.userData.digit = null;
+  }
+  piece.userData.value   = value;
+  piece.userData.isGiven = isGiven;
+  if (value === 0 || value == null) return;
+  const { x, y, size } = piece.userData.digitLocal;
+  const m = makeDigitPlane(value, isGiven, size);
+  m.position.set(x, y, _DIGIT_LIFT);
+  piece.add(m);
+  piece.userData.digit = m;
+}
+
+// Per-frame: rotate every piece's digit plane so its +Y aligns with the
+// camera's up vector, projected into the piece's local face plane (XY).
+const _camUpWorld = new THREE.Vector3();
+const _localUp    = new THREE.Vector3();
+const _invMat     = new THREE.Matrix4();
+function updatePolyhedralDigits(pieces, group, camera) {
+  if (!group) return;
+  group.updateMatrixWorld(true);
+  _camUpWorld.set(0, 1, 0).applyQuaternion(camera.quaternion);
+  for (const p of pieces) {
+    const d = p.userData.digit;
+    if (!d) continue;
+    _invMat.copy(p.matrixWorld).invert();
+    _localUp.copy(_camUpWorld).transformDirection(_invMat);
+    d.rotation.z = Math.atan2(_localUp.y, _localUp.x) - Math.PI / 2;
+  }
+}
+
+// Shared digit-key handler for polyhedral shapes. Returns true if consumed.
+//   ctx = { getTarget, onChange }  where getTarget() returns the editable piece (or null)
+function handleDigitKey(e, ctx) {
+  const k = e.key;
+  const t = ctx.getTarget();
+  if (!t || t.userData.isGiven) {
+    // Still consume the key to avoid surprise behavior, but only if it's a digit key.
+    if ((k >= '0' && k <= '9') || k === 'Backspace' || k === 'Delete') {
+      e.preventDefault(); return true;
+    }
+    return false;
+  }
+  if (k >= '1' && k <= '9') {
+    ctx.onChange(t, parseInt(k));
+    e.preventDefault(); return true;
+  }
+  if (k === '0' || k === 'Backspace' || k === 'Delete') {
+    ctx.onChange(t, 0);
+    e.preventDefault(); return true;
+  }
+  return false;
 }
 
 // ============================================================================
@@ -290,7 +426,6 @@ const SHAPES = []; // populated after all shape factories defined
 function makeCubeShape() {
   const N = 9;
   const cubeSize = 1;
-  const GIVEN_PROBABILITY = 0.30;
 
   let group = null;
   let allCubes = [];
@@ -330,38 +465,8 @@ function makeCubeShape() {
     geometry.attributes.normal.needsUpdate = true;
   }
 
-  // --- digit canvas textures ---
-  function makeNumberSpriteTexture(num, color) {
-    const c = document.createElement('canvas');
-    c.width = c.height = 128;
-    const g = c.getContext('2d');
-    g.shadowColor = 'rgba(0, 0, 0, 0.55)';
-    g.shadowBlur = 8;
-    g.shadowOffsetY = 2;
-    g.fillStyle = color;
-    g.font = '800 96px "SF Pro Display", -apple-system, system-ui, "Helvetica Neue", Arial, sans-serif';
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    g.fillText(String(num), 64, 70);
-    const tex = new THREE.CanvasTexture(c);
-    tex.anisotropy = 8;
-    tex.encoding = THREE.sRGBEncoding;
-    return tex;
-  }
-  const givenPlaneMats = {}, userPlaneMats = {};
-  for (let n = 1; n <= 9; n++) {
-    givenPlaneMats[n] = new THREE.MeshBasicMaterial({
-      map: makeNumberSpriteTexture(n, '#fff2c8'),
-      transparent: true, depthWrite: false,
-    });
-    userPlaneMats[n] = new THREE.MeshBasicMaterial({
-      map: makeNumberSpriteTexture(n, '#bfe0ff'),
-      transparent: true, depthWrite: false,
-    });
-  }
   const PLANE_SIZE = 0.82;
   const PLANE_OFFSET = 0.501;
-  const digitPlaneGeom = new THREE.PlaneGeometry(PLANE_SIZE, PLANE_SIZE);
 
   const FACE_DIRS = [
     { axis: 'x', sign: +1, normal: new THREE.Vector3( 1, 0, 0), up: new THREE.Vector3(0, 1, 0) },
@@ -384,9 +489,10 @@ function makeCubeShape() {
     f.upCandidates = f.quats.map(q => new THREE.Vector3(0, 1, 0).applyQuaternion(q));
     f.quat = f.quats[0];
   }
-  function makeDigitPlane(value, isGiven, face) {
-    const mat = (isGiven ? givenPlaneMats : userPlaneMats)[value];
-    const m = new THREE.Mesh(digitPlaneGeom, mat);
+  function makeDigitPlaneForCubeFace(value, isGiven, face) {
+    const mat = (isGiven ? DIGIT_GIVEN_MATS : DIGIT_USER_MATS)[value];
+    const m = new THREE.Mesh(_unitDigitGeom, mat);
+    m.scale.set(PLANE_SIZE, PLANE_SIZE, 1);
     m.renderOrder = 2;
     m.position.copy(face.normal).multiplyScalar(PLANE_OFFSET);
     m.quaternion.copy(face.quat);
@@ -449,7 +555,7 @@ function makeCubeShape() {
       grid[i][j][k] = cube;
       cube.add(new THREE.LineSegments(edgesGeom, edgesMat));
       if (value !== 0) for (const f of faces) {
-        const pl = makeDigitPlane(value, isGiven, f);
+        const pl = makeDigitPlaneForCubeFace(value, isGiven, f);
         cube.add(pl);
         cube.userData.planes.push(pl);
       }
@@ -474,7 +580,7 @@ function makeCubeShape() {
     for (const pl of cube.userData.planes) cube.remove(pl);
     cube.userData.planes.length = 0;
     if (value !== 0) for (const f of cube.userData.faces) {
-      const pl = makeDigitPlane(value, false, f);
+      const pl = makeDigitPlaneForCubeFace(value, false, f);
       cube.add(pl);
       cube.userData.planes.push(pl);
     }
@@ -652,12 +758,18 @@ function makeKilominxShape() {
   let group = null;
   let pieces = [];
   let kiteGeom = null, kiteOutlineGeom = null, kiteHighlightGeom = null;
-  let selected = null;
+  let selected = null;        // sibling group (array)
+  let selectedSticker = null; // the specific clicked piece (edit target)
+  let givenCount = 0, userEntries = 0;
+  let kiteDigitCentroid = [0, 0], kiteDigitSize = 0.5;
 
   function build() {
     group = new THREE.Group();
     pieces = [];
     selected = null;
+    selectedSticker = null;
+    givenCount = 0;
+    userEntries = 0;
     const sourceGeom = new THREE.DodecahedronGeometry(2.5);
     const faces = extractPolyhedralFaces(sourceGeom);
     sourceGeom.dispose();
@@ -690,6 +802,8 @@ function makeKilominxShape() {
     const pts2d = [[Cl[0],Cl[1]], [Nl[0],Nl[1]], [Vl[0],Vl[1]], [Pl[0],Pl[1]]];
     kiteOutlineGeom   = makeOutlineGeom(pts2d, 0.022, 0.004);
     kiteHighlightGeom = makeHighlightGeom(pts2d, 0.07, 0.008);
+    kiteDigitCentroid = centroidOf2D(pts2d);
+    kiteDigitSize     = fitDigitSize(pts2d, 0.75);
 
     const baseMat = new THREE.MeshStandardMaterial({ color: 0x6a7fc8, roughness: 0.5, metalness: 0.08, flatShading: true });
     for (const f of faces) {
@@ -702,7 +816,11 @@ function makeKilominxShape() {
         const M  = new THREE.Matrix4().makeBasis(xA, yA, zA).setPosition(C);
         const piece = new THREE.Mesh(kiteGeom, baseMat.clone());
         piece.applyMatrix4(M);
-        piece.userData = { type: 'kite', face: faces.indexOf(f), slot: i, outerVertex: V.clone() };
+        piece.userData = {
+          type: 'kite', face: faces.indexOf(f), slot: i, outerVertex: V.clone(),
+          digitLocal: { x: kiteDigitCentroid[0], y: kiteDigitCentroid[1], size: kiteDigitSize },
+          value: 0, isGiven: false, digit: null,
+        };
         const outline = new THREE.Mesh(kiteOutlineGeom, POLY_OUTLINE_MAT);
         outline.renderOrder = 1;
         piece.add(outline);
@@ -719,24 +837,45 @@ function makeKilominxShape() {
     }
     let cornerIdx = 0;
     for (const members of cornerByKey.values()) {
-      for (const p of members) { p.userData.corner = cornerIdx; p.userData.siblings = members; }
+      // One random value per corner piece — all 3 stickers share it.
+      const isGiven = Math.random() < GIVEN_PROBABILITY;
+      const value   = isGiven ? Math.floor(Math.random() * 9) + 1 : 0;
+      if (isGiven) givenCount++;
+      for (const p of members) {
+        p.userData.corner = cornerIdx;
+        p.userData.siblings = members;
+        setPieceDigit(p, value, isGiven);
+      }
       cornerIdx++;
     }
+  }
+
+  function setKiteValue(piece, value) {
+    if (!piece || piece.userData.isGiven) return;
+    const prev = piece.userData.value;
+    for (const sib of piece.userData.siblings) setPieceDigit(sib, value, false);
+    if (prev === 0 && value !== 0) userEntries++;
+    else if (prev !== 0 && value === 0) userEntries--;
+    refreshSelected();
+    statsEl.innerHTML = api.statsHTML();
   }
 
   const api = {
     name: 'Sudoku Kilominx',
     subtitle: '60 kite pieces tiling a dodecahedron (corners only).',
-    controlsHTML: '<kbd>left-click</kbd> select piece &nbsp; <kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
+    controlsHTML:
+      '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
+      '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
     cameraDistance: 9,
     install() { build(); scene.add(group); },
-    uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; },
+    uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; },
     get pickables() { return pieces; },
     pick(hit) {
       if (selected) for (const m of selected) {
         m.material.emissive.setHex(0x000000); m.material.emissiveIntensity = 1;
         if (m.userData.highlight) { m.remove(m.userData.highlight); m.userData.highlight = null; }
       }
+      selectedSticker = hit ? hit.object : null;
       selected = hit ? hit.object.userData.siblings : null;
       if (selected) for (const m of selected) {
         m.material.emissive = new THREE.Color(0xffd166);
@@ -748,18 +887,32 @@ function makeKilominxShape() {
       refreshSelected();
     },
     clearPick() { this.pick(null); },
+    keydown(e) {
+      return handleDigitKey(e, {
+        getTarget: () => selectedSticker,
+        onChange:  (piece, value) => setKiteValue(piece, value),
+      });
+    },
+    frame() { updatePolyhedralDigits(pieces, group, camera); },
     selectedInfoHTML() {
       if (!selected) return 'No piece selected';
       const cornerIdx = selected[0].userData.corner;
       const faces = selected.map(m => m.userData.face + 1).sort((a, b) => a - b);
+      const ud = selectedSticker ? selectedSticker.userData : selected[0].userData;
+      let v;
+      if (ud.value === 0)   v = '<span class="dim">empty</span>';
+      else if (ud.isGiven)  v = `<span class="given">${ud.value}</span> <span class="dim">(given)</span>`;
+      else                  v = `<span class="user">${ud.value}</span>`;
       return `<b>Selected corner</b> <span class="pill kite">Kite</span><br>` +
              `<span class="dim">Corner</span> ${cornerIdx + 1} <span class="dim">/ 20</span><br>` +
-             `<span class="dim">Touches faces</span> ${faces.join(', ')}`;
+             `<span class="dim">Touches faces</span> ${faces.join(', ')}<br>` +
+             `<span class="dim">Piece value</span> ${v}`;
     },
     statsHTML() {
       return `<span class="dim">corners</span> <span class="stat-num">20</span><br>` +
              `<span class="dim">stickers</span> <span class="stat-num">60</span><br>` +
-             `<span class="dim">faces</span> <span class="stat-num">12</span>`;
+             `<span class="dim">given clues</span> <span class="stat-num">${givenCount}</span><br>` +
+             `<span class="dim">your entries</span> <span class="stat-num">${userEntries}</span>`;
     },
   };
   return api;
@@ -777,14 +930,20 @@ function makeMinxLikeShape(opts) {
   let group = null;
   let pieces = [];
   let selected = null;
+  let selectedSticker = null;
+  let givenCount = 0, userEntries = 0;
   let centerGeom = null, centerOutlineGeom = null, centerHighlightGeom = null;
   let edgeGeom = null, edgeOutlineGeom = null, edgeHighlightGeom = null;
   let cornerGeom = null, cornerOutlineGeom = null, cornerHighlightGeom = null;
+  let centerDigitInfo = null, cornerDigitInfo = null, edgeDigitInfo = null;
 
   function build() {
     group = new THREE.Group();
     pieces = [];
     selected = null;
+    selectedSticker = null;
+    givenCount = 0;
+    userEntries = 0;
 
     const sourceGeom = opts.sourceGeomFactory();
     const faces = extractPolyhedralFaces(sourceGeom);
@@ -826,6 +985,7 @@ function makeMinxLikeShape(opts) {
     centerGeom.computeVertexNormals();
     centerOutlineGeom   = makeOutlineGeom(centerPts, 0.022, 0.004);
     centerHighlightGeom = makeHighlightGeom(centerPts, 0.10, 0.008);
+    centerDigitInfo = { x: 0, y: 0, size: fitDigitSize(centerPts, 0.70) };
 
     // -- CORNER template [W, A, V, B]
     {
@@ -845,6 +1005,8 @@ function makeMinxLikeShape(opts) {
       cornerGeom.computeVertexNormals();
       cornerOutlineGeom   = makeOutlineGeom(cornerPts, 0.022, 0.004);
       cornerHighlightGeom = makeHighlightGeom(cornerPts, 0.10, 0.008);
+      const [ccx, ccy] = centroidOf2D(cornerPts);
+      cornerDigitInfo = { x: ccx, y: ccy, size: fitDigitSize(cornerPts, 0.70) };
     }
 
     // -- EDGE template [W_i, B_i, A_{i+1}, W_{i+1}] anchored at edge midpoint
@@ -872,6 +1034,8 @@ function makeMinxLikeShape(opts) {
       edgeGeom.computeVertexNormals();
       edgeOutlineGeom   = makeOutlineGeom(edgePts, 0.022, 0.004);
       edgeHighlightGeom = makeHighlightGeom(edgePts, 0.10, 0.008);
+      const [ecx, ecy] = centroidOf2D(edgePts);
+      edgeDigitInfo = { x: ecx, y: ecy, size: fitDigitSize(edgePts, 0.70) };
     }
 
     const centerMat = new THREE.MeshStandardMaterial({ color: opts.colors.center, roughness: 0.5, metalness: 0.08, flatShading: true });
@@ -889,7 +1053,10 @@ function makeMinxLikeShape(opts) {
         const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
         const piece = new THREE.Mesh(centerGeom, centerMat.clone());
         piece.applyMatrix4(M);
-        piece.userData = { type: 'center', face: fi, groupKey: `C${fi}` };
+        piece.userData = {
+          type: 'center', face: fi, groupKey: `C${fi}`,
+          digitLocal: centerDigitInfo, value: 0, isGiven: false, digit: null,
+        };
         const outline = new THREE.Mesh(centerOutlineGeom, POLY_OUTLINE_MAT);
         outline.renderOrder = 1; piece.add(outline);
         group.add(piece); pieces.push(piece);
@@ -902,7 +1069,10 @@ function makeMinxLikeShape(opts) {
         const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
         const piece = new THREE.Mesh(cornerGeom, cornerMat.clone());
         piece.applyMatrix4(M);
-        piece.userData = { type: 'corner', face: fi, slot: i, groupKey: `V${POLY_KEY(V)}` };
+        piece.userData = {
+          type: 'corner', face: fi, slot: i, groupKey: `V${POLY_KEY(V)}`,
+          digitLocal: cornerDigitInfo, value: 0, isGiven: false, digit: null,
+        };
         const outline = new THREE.Mesh(cornerOutlineGeom, POLY_OUTLINE_MAT);
         outline.renderOrder = 1; piece.add(outline);
         group.add(piece); pieces.push(piece);
@@ -916,7 +1086,10 @@ function makeMinxLikeShape(opts) {
         const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
         const piece = new THREE.Mesh(edgeGeom, edgeMat.clone());
         piece.applyMatrix4(M);
-        piece.userData = { type: 'edge', face: fi, slot: i, groupKey: `E${POLY_KEY(Mp)}` };
+        piece.userData = {
+          type: 'edge', face: fi, slot: i, groupKey: `E${POLY_KEY(Mp)}`,
+          digitLocal: edgeDigitInfo, value: 0, isGiven: false, digit: null,
+        };
         const outline = new THREE.Mesh(edgeOutlineGeom, POLY_OUTLINE_MAT);
         outline.renderOrder = 1; piece.add(outline);
         group.add(piece); pieces.push(piece);
@@ -934,7 +1107,15 @@ function makeMinxLikeShape(opts) {
     for (const members of groupMap.values()) {
       const type = members[0].userData.type;
       const gi = counters[type]++;
-      for (const m of members) { m.userData.siblings = members; m.userData.groupIndex = gi; }
+      // One random value per piece — all sibling stickers share it.
+      const isGiven = Math.random() < GIVEN_PROBABILITY;
+      const value   = isGiven ? Math.floor(Math.random() * 9) + 1 : 0;
+      if (isGiven) givenCount++;
+      for (const m of members) {
+        m.userData.siblings = members;
+        m.userData.groupIndex = gi;
+        setPieceDigit(m, value, isGiven);
+      }
     }
   }
 
@@ -944,16 +1125,19 @@ function makeMinxLikeShape(opts) {
   const api = {
     name: opts.name,
     subtitle: opts.subtitle,
-    controlsHTML: '<kbd>left-click</kbd> select piece &nbsp; <kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
+    controlsHTML:
+      '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
+      '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
     cameraDistance: 9,
     install() { build(); scene.add(group); },
-    uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; },
+    uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; },
     get pickables() { return pieces; },
     pick(hit) {
       if (selected) for (const m of selected) {
         m.material.emissive.setHex(0x000000); m.material.emissiveIntensity = 1;
         if (m.userData.highlight) { m.remove(m.userData.highlight); m.userData.highlight = null; }
       }
+      selectedSticker = hit ? hit.object : null;
       selected = hit ? hit.object.userData.siblings : null;
       if (selected) {
         const hlGeom = HL_BY_TYPE()[selected[0].userData.type];
@@ -968,21 +1152,44 @@ function makeMinxLikeShape(opts) {
       refreshSelected();
     },
     clearPick() { this.pick(null); },
+    keydown(e) {
+      return handleDigitKey(e, {
+        getTarget: () => selectedSticker,
+        onChange: (piece, value) => {
+          const prev = piece.userData.value;
+          for (const sib of piece.userData.siblings) setPieceDigit(sib, value, false);
+          if (prev === 0 && value !== 0) userEntries++;
+          else if (prev !== 0 && value === 0) userEntries--;
+          refreshSelected();
+          statsEl.innerHTML = api.statsHTML();
+        },
+      });
+    },
+    frame() { updatePolyhedralDigits(pieces, group, camera); },
     selectedInfoHTML() {
       if (!selected) return 'No piece selected';
       const first = selected[0];
       const type = first.userData.type;
       const gi = first.userData.groupIndex;
       const faces = selected.map(m => m.userData.face + 1).sort((a, b) => a - b);
+      const ud = selectedSticker ? selectedSticker.userData : first.userData;
+      let v;
+      if (ud.value === 0)   v = '<span class="dim">empty</span>';
+      else if (ud.isGiven)  v = `<span class="given">${ud.value}</span> <span class="dim">(given)</span>`;
+      else                  v = `<span class="user">${ud.value}</span>`;
       return `<b>Selected piece</b> <span class="pill ${type}">${TYPE_LABEL[type]}</span><br>` +
              `<span class="dim">${TYPE_LABEL[type]}</span> ${gi + 1} <span class="dim">/ ${opts.totals[type]}</span><br>` +
              `<span class="dim">Stickers</span> ${selected.length}<br>` +
-             `<span class="dim">${faces.length > 1 ? 'Touches faces' : 'On face'}</span> ${faces.join(', ')}`;
+             `<span class="dim">${faces.length > 1 ? 'Touches faces' : 'On face'}</span> ${faces.join(', ')}<br>` +
+             `<span class="dim">Piece value</span> ${v}`;
     },
     statsHTML() {
-      return opts.statLines.map(([label, val]) =>
+      const base = opts.statLines.map(([label, val]) =>
         `<span class="dim">${label}</span> <span class="stat-num">${val}</span>`
       ).join('<br>');
+      return base +
+             `<br><span class="dim">given clues</span> <span class="stat-num">${givenCount}</span>` +
+             `<br><span class="dim">your entries</span> <span class="stat-num">${userEntries}</span>`;
     },
   };
   return api;
