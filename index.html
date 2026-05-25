@@ -1,0 +1,1103 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sudoku Polyhedra</title>
+<style>
+  body {
+    margin: 0; overflow: hidden;
+    background: radial-gradient(ellipse at 50% 38%, #1e1640 0%, #0c0a20 45%, #050410 100%);
+    font-family: -apple-system, "SF Pro Display", system-ui, sans-serif;
+    color: #e8e8f0;
+  }
+  .panel {
+    position: absolute;
+    padding: 12px 16px;
+    background: rgba(12, 10, 24, 0.55);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+    user-select: none;
+    font-size: 13px; line-height: 1.55;
+  }
+  #info     { top: 16px;    left: 16px; max-width: 360px; }
+  #stats    { top: 16px;    right: 16px; text-align: right; min-width: 150px; }
+  #selected { bottom: 16px; left: 16px;  min-width: 240px; }
+  b { color: #ffd166; font-weight: 600; letter-spacing: 0.02em; }
+  kbd {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.12);
+    padding: 2px 7px; border-radius: 5px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px; color: #e8e8f0;
+  }
+  .dim { opacity: 0.6; }
+  .given { color: #ffd166; }
+  .user  { color: #7fbfff; }
+  .stat-num { font-size: 18px; font-weight: 600; color: #ffd166; }
+  .pill {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .pill.cell    { background: rgba(127,191,255,0.20); color: #bfe0ff; }
+  .pill.center  { background: rgba(212,167,102,0.20); color: #f0c98a; }
+  .pill.edge    { background: rgba(106,127,200,0.20); color: #aebef5; }
+  .pill.corner  { background: rgba(159,118,224,0.22); color: #cbb0f8; }
+  .pill.kite    { background: rgba(102,200,167,0.20); color: #8feac0; }
+
+  /* Shape navigator header inside #info */
+  .nav {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 6px;
+  }
+  .nav .title {
+    flex: 1; text-align: center;
+    font-size: 15px; font-weight: 700; letter-spacing: 0.02em;
+    color: #ffd166;
+  }
+  .nav button {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: #e8e8f0;
+    width: 28px; height: 28px;
+    border-radius: 8px;
+    font-size: 14px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s, transform 0.08s;
+  }
+  .nav button:hover  { background: rgba(255,255,255,0.14); }
+  .nav button:active { transform: scale(0.92); }
+  .nav .dots { display: flex; gap: 4px; justify-content: center; margin-top: 4px; }
+  .nav .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: rgba(255,255,255,0.18);
+    transition: background 0.2s;
+  }
+  .nav .dot.active { background: #ffd166; }
+
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="info" class="panel">
+  <div class="nav">
+    <button id="navPrev" aria-label="Previous shape">◀</button>
+    <div class="title" id="navTitle">—</div>
+    <button id="navNext" aria-label="Next shape">▶</button>
+  </div>
+  <div class="dots" id="navDots"></div>
+  <div id="infoBody" style="margin-top: 10px"></div>
+</div>
+<div id="stats" class="panel"></div>
+<div id="selected" class="panel">No piece selected</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ============================================================================
+//  SHARED SCENE / CAMERA / RENDERER / LIGHTING
+// ============================================================================
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 1000);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x000000, 0);
+renderer.outputEncoding = THREE.sRGBEncoding;
+document.body.appendChild(renderer.domElement);
+renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+
+scene.add(new THREE.HemisphereLight(0xb8c4ff, 0x2a1f3a, 0.6));
+const keyLight  = new THREE.DirectionalLight(0xffe4c0, 0.9); keyLight.position.set(8, 14, 12);  scene.add(keyLight);
+const rimLight  = new THREE.DirectionalLight(0x88a8ff, 0.5); rimLight.position.set(-12, -2, -8); scene.add(rimLight);
+const fillLight = new THREE.DirectionalLight(0xffb8d0, 0.25); fillLight.position.set(4, -10, 6); scene.add(fillLight);
+
+// Every shape gets its own root group attached/detached on switch.
+let activeShape = null;
+
+const infoBodyEl = document.getElementById('infoBody');
+const statsEl    = document.getElementById('stats');
+const selectedEl = document.getElementById('selected');
+const navTitleEl = document.getElementById('navTitle');
+const navDotsEl  = document.getElementById('navDots');
+
+// ============================================================================
+//  POLYHEDRAL HELPERS (shared by kilominx, megaminx, icosaminx)
+// ============================================================================
+
+// Extract the 12 (dodec) or 20 (icos) faces from a primitive's position buffer.
+// Returns array of { normal, center, verts (sorted CCW around normal) }.
+function extractPolyhedralFaces(sourceGeom, faceTol = 0.01) {
+  const pos = sourceGeom.attributes.position;
+  const idx = sourceGeom.index;
+  const triCount = idx ? idx.count / 3 : pos.count / 3;
+  const tris = [];
+  for (let t = 0; t < triCount; t++) {
+    const i0 = idx ? idx.getX(t * 3 + 0) : t * 3 + 0;
+    const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
+    const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+    const v0 = new THREE.Vector3().fromBufferAttribute(pos, i0);
+    const v1 = new THREE.Vector3().fromBufferAttribute(pos, i1);
+    const v2 = new THREE.Vector3().fromBufferAttribute(pos, i2);
+    const n = new THREE.Vector3().subVectors(v1, v0)
+                .cross(new THREE.Vector3().subVectors(v2, v0))
+                .normalize();
+    tris.push({ vs: [v0, v1, v2], n });
+  }
+  const faces = [];
+  for (const t of tris) {
+    let f = faces.find(ff => ff.normal.dot(t.n) > 1 - faceTol);
+    if (!f) { f = { normal: t.n.clone(), tris: [] }; faces.push(f); }
+    f.tris.push(t);
+  }
+  const KEY = v => `${v.x.toFixed(4)},${v.y.toFixed(4)},${v.z.toFixed(4)}`;
+  for (const f of faces) {
+    const vmap = new Map();
+    for (const t of f.tris) for (const v of t.vs) {
+      const k = KEY(v);
+      if (!vmap.has(k)) vmap.set(k, v.clone());
+    }
+    const verts = Array.from(vmap.values());
+    const center = new THREE.Vector3();
+    for (const v of verts) center.add(v);
+    center.multiplyScalar(1 / verts.length);
+    const u0 = new THREE.Vector3().subVectors(verts[0], center).normalize();
+    const w  = new THREE.Vector3().crossVectors(f.normal, u0);
+    const ang = v => {
+      const r = new THREE.Vector3().subVectors(v, center);
+      return Math.atan2(r.dot(w), r.dot(u0));
+    };
+    verts.sort((a, b) => ang(a) - ang(b));
+    f.verts = verts;
+    f.center = center;
+  }
+  return faces;
+}
+const POLY_KEY = v => `${v.x.toFixed(4)},${v.y.toFixed(4)},${v.z.toFixed(4)}`;
+
+// Quad-strip outline around a closed polygon (2D points in face plane).
+function makeOutlineGeom(pts2d, halfW, lift) {
+  const pos = [], idx = [];
+  let vi = 0;
+  for (let i = 0; i < pts2d.length; i++) {
+    const a = pts2d[i], b = pts2d[(i + 1) % pts2d.length];
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len * halfW, ny = dx / len * halfW;
+    pos.push(
+      a[0] + nx, a[1] + ny, lift,
+      a[0] - nx, a[1] - ny, lift,
+      b[0] + nx, b[1] + ny, lift,
+      b[0] - nx, b[1] - ny, lift,
+    );
+    idx.push(vi, vi + 1, vi + 2,  vi + 1, vi + 3, vi + 2);
+    vi += 4;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+  g.setIndex(idx);
+  return g;
+}
+
+// Centroid-shrunk LineSegments loop — selection highlight.
+function makeHighlightGeom(pts2d, shrink, lift) {
+  let cx = 0, cy = 0;
+  for (const p of pts2d) { cx += p[0]; cy += p[1]; }
+  cx /= pts2d.length; cy /= pts2d.length;
+  const sp = pts2d.map(p => [cx + (p[0] - cx) * (1 - shrink), cy + (p[1] - cy) * (1 - shrink)]);
+  const pos = [];
+  for (let i = 0; i < sp.length; i++) {
+    const a = sp[i], b = sp[(i + 1) % sp.length];
+    pos.push(a[0], a[1], lift, b[0], b[1], lift);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+  return g;
+}
+
+const POLY_OUTLINE_MAT = new THREE.MeshBasicMaterial({
+  color: 0x07060f, side: THREE.DoubleSide,
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+});
+const POLY_HL_MAT = new THREE.LineBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.95 });
+
+// Dispose all materials/geometries reachable from a group (best-effort).
+function disposeGroup(group) {
+  group.traverse(obj => {
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) {
+      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+      for (const m of mats) {
+        if (m.map) m.map.dispose();
+        m.dispose();
+      }
+    }
+  });
+}
+
+// ============================================================================
+//  SHAPE FRAMEWORK
+//  Each shape exposes:
+//    name, subtitle, controlsHTML
+//    install(scene)                 — builds + adds its root group to the scene
+//    uninstall()                    — removes + disposes its root group
+//    pickables                      — array of meshes the raycaster targets
+//    pick(intersection)             — handle a successful pick
+//    clearPick()                    — deselect (e.g. on shape switch)
+//    selectedInfoHTML()             — fills #selected
+//    statsHTML()                    — fills #stats
+//    keydown?(e)                    — optional keyboard handler
+//    frame?(dt, t)                  — optional per-frame animation
+//    cameraDistance                 — default camera Z
+//    onResetSelection?()            — fired when shape becomes active
+// ============================================================================
+
+function refreshPanels() {
+  if (!activeShape) return;
+  navTitleEl.textContent = activeShape.name;
+  infoBodyEl.innerHTML =
+    `<span class="dim">${activeShape.subtitle}</span><br><br>${activeShape.controlsHTML}`;
+  statsEl.innerHTML = activeShape.statsHTML();
+  refreshSelected();
+  refreshDots();
+}
+function refreshSelected() {
+  selectedEl.innerHTML = activeShape ? activeShape.selectedInfoHTML() : 'No selection';
+}
+function refreshDots() {
+  navDotsEl.innerHTML = SHAPES.map((s, i) =>
+    `<div class="dot${SHAPES[activeShapeIndex] === s ? ' active' : ''}"></div>`
+  ).join('');
+}
+
+function switchToShape(index) {
+  if (activeShape) activeShape.uninstall();
+  activeShapeIndex = ((index % SHAPES.length) + SHAPES.length) % SHAPES.length;
+  activeShape = SHAPES[activeShapeIndex];
+  activeShape.install(scene);
+  camera.position.set(0, 0, activeShape.cameraDistance);
+  refreshPanels();
+}
+
+let activeShapeIndex = 0;
+const SHAPES = []; // populated after all shape factories defined
+
+// ============================================================================
+//  SHAPE 1 — SUDOKU CUBE  (9×9×9 shell, digits, flip, arrow-move)
+// ============================================================================
+function makeCubeShape() {
+  const N = 9;
+  const cubeSize = 1;
+  const GIVEN_PROBABILITY = 0.30;
+
+  let group = null;
+  let allCubes = [];
+  let grid = null;
+  let givenCount = 0;
+  let userEntries = 0;
+  let selectedCube = null;
+  let highlightInner = null, highlightOuter = null;
+  let _t = 0;
+  let rotX = 0, rotY = 0, targetRotX = 0, targetRotY = 0;
+  let zoom = 28;
+
+  // --- rounded box geometry (smoothed corners) ---
+  function smoothCoincidentNormals(geometry, tolerance = 1e-4) {
+    const positions = geometry.attributes.position.array;
+    const normals = geometry.attributes.normal.array;
+    const count = positions.length / 3;
+    const inv = 1 / tolerance;
+    const groups = new Map();
+    for (let i = 0; i < count; i++) {
+      const kx = Math.round(positions[i*3]   * inv);
+      const ky = Math.round(positions[i*3+1] * inv);
+      const kz = Math.round(positions[i*3+2] * inv);
+      const key = kx + ',' + ky + ',' + kz;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(i);
+    }
+    for (const idxs of groups.values()) {
+      if (idxs.length < 2) continue;
+      let nx = 0, ny = 0, nz = 0;
+      for (const i of idxs) { nx += normals[i*3]; ny += normals[i*3+1]; nz += normals[i*3+2]; }
+      const len = Math.hypot(nx, ny, nz);
+      if (len === 0) continue;
+      nx /= len; ny /= len; nz /= len;
+      for (const i of idxs) { normals[i*3] = nx; normals[i*3+1] = ny; normals[i*3+2] = nz; }
+    }
+    geometry.attributes.normal.needsUpdate = true;
+  }
+
+  // --- digit canvas textures ---
+  function makeNumberSpriteTexture(num, color) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    g.shadowColor = 'rgba(0, 0, 0, 0.55)';
+    g.shadowBlur = 8;
+    g.shadowOffsetY = 2;
+    g.fillStyle = color;
+    g.font = '800 96px "SF Pro Display", -apple-system, system-ui, "Helvetica Neue", Arial, sans-serif';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(String(num), 64, 70);
+    const tex = new THREE.CanvasTexture(c);
+    tex.anisotropy = 8;
+    tex.encoding = THREE.sRGBEncoding;
+    return tex;
+  }
+  const givenPlaneMats = {}, userPlaneMats = {};
+  for (let n = 1; n <= 9; n++) {
+    givenPlaneMats[n] = new THREE.MeshBasicMaterial({
+      map: makeNumberSpriteTexture(n, '#fff2c8'),
+      transparent: true, depthWrite: false,
+    });
+    userPlaneMats[n] = new THREE.MeshBasicMaterial({
+      map: makeNumberSpriteTexture(n, '#bfe0ff'),
+      transparent: true, depthWrite: false,
+    });
+  }
+  const PLANE_SIZE = 0.82;
+  const PLANE_OFFSET = 0.501;
+  const digitPlaneGeom = new THREE.PlaneGeometry(PLANE_SIZE, PLANE_SIZE);
+
+  const FACE_DIRS = [
+    { axis: 'x', sign: +1, normal: new THREE.Vector3( 1, 0, 0), up: new THREE.Vector3(0, 1, 0) },
+    { axis: 'x', sign: -1, normal: new THREE.Vector3(-1, 0, 0), up: new THREE.Vector3(0, 1, 0) },
+    { axis: 'y', sign: +1, normal: new THREE.Vector3( 0, 1, 0), up: new THREE.Vector3(0, 0, 1) },
+    { axis: 'y', sign: -1, normal: new THREE.Vector3( 0,-1, 0), up: new THREE.Vector3(0, 0,-1) },
+    { axis: 'z', sign: +1, normal: new THREE.Vector3( 0, 0, 1), up: new THREE.Vector3(0, 1, 0) },
+    { axis: 'z', sign: -1, normal: new THREE.Vector3( 0, 0,-1), up: new THREE.Vector3(0, 1, 0) },
+  ];
+  const _PI2 = Math.PI / 2;
+  for (const f of FACE_DIRS) {
+    const right = new THREE.Vector3().crossVectors(f.up, f.normal).normalize();
+    const up    = new THREE.Vector3().crossVectors(f.normal, right).normalize();
+    const basis = new THREE.Matrix4().makeBasis(right, up, f.normal);
+    const base  = new THREE.Quaternion().setFromRotationMatrix(basis);
+    f.quats = [0, 1, 2, 3].map(k => {
+      const spin = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), k * _PI2);
+      return base.clone().multiply(spin);
+    });
+    f.upCandidates = f.quats.map(q => new THREE.Vector3(0, 1, 0).applyQuaternion(q));
+    f.quat = f.quats[0];
+  }
+  function makeDigitPlane(value, isGiven, face) {
+    const mat = (isGiven ? givenPlaneMats : userPlaneMats)[value];
+    const m = new THREE.Mesh(digitPlaneGeom, mat);
+    m.renderOrder = 2;
+    m.position.copy(face.normal).multiplyScalar(PLANE_OFFSET);
+    m.quaternion.copy(face.quat);
+    m.userData.face = face;
+    return m;
+  }
+  function outerFacesFor(i, j, k) {
+    const out = [];
+    if (i === 0)     out.push(FACE_DIRS[1]);
+    if (i === N - 1) out.push(FACE_DIRS[0]);
+    if (j === 0)     out.push(FACE_DIRS[3]);
+    if (j === N - 1) out.push(FACE_DIRS[2]);
+    if (k === 0)     out.push(FACE_DIRS[5]);
+    if (k === N - 1) out.push(FACE_DIRS[4]);
+    return out;
+  }
+  function blockColor(i, j, k) {
+    const bi = Math.floor(i / 3), bj = Math.floor(j / 3), bk = Math.floor(k / 3);
+    const hueBases = [200, 258, 318];
+    const hue = hueBases[bi] + bk * 14;
+    const sat = 0.32 + bk * 0.09;
+    const lit = 0.55 + (bj - 1) * 0.07;
+    return new THREE.Color().setHSL(((hue % 360) + 360) % 360 / 360, sat, lit);
+  }
+
+  // --- build ---
+  const geom = new THREE.BoxGeometry(cubeSize, cubeSize, cubeSize);
+  const edgesGeom = new THREE.EdgesGeometry(geom);
+  const edgesMat = new THREE.LineBasicMaterial({ color: 0x0a0816, transparent: true, opacity: 0.65 });
+
+  const total = N * cubeSize;
+  const start = -total / 2 + cubeSize / 2;
+  const gridPos = i => start + i * cubeSize;
+
+  function build() {
+    group = new THREE.Group();
+    allCubes = [];
+    grid = Array.from({length: N}, () => Array.from({length: N}, () => Array(N).fill(null)));
+    givenCount = 0;
+    userEntries = 0;
+    rotX = rotY = targetRotX = targetRotY = 0;
+    zoom = 28;
+
+    for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) for (let k = 0; k < N; k++) {
+      const isShell = (i === 0 || i === N - 1 || j === 0 || j === N - 1 || k === 0 || k === N - 1);
+      if (!isShell) continue;
+      const baseColor = blockColor(i, j, k);
+      const isGiven = Math.random() < GIVEN_PROBABILITY;
+      const value   = isGiven ? Math.floor(Math.random() * 9) + 1 : 0;
+      if (isGiven) givenCount++;
+
+      const mat = new THREE.MeshStandardMaterial({ color: baseColor, metalness: 0.08, roughness: 0.42 });
+      const cube = new THREE.Mesh(geom, mat);
+      const p = new THREE.Vector3(gridPos(i), gridPos(j), gridPos(k));
+      cube.position.copy(p);
+      const faces = outerFacesFor(i, j, k);
+      cube.userData = { i, j, k, targetPos: p.clone(), isGiven, value, planes: [], faces };
+      group.add(cube);
+      allCubes.push(cube);
+      grid[i][j][k] = cube;
+      cube.add(new THREE.LineSegments(edgesGeom, edgesMat));
+      if (value !== 0) for (const f of faces) {
+        const pl = makeDigitPlane(value, isGiven, f);
+        cube.add(pl);
+        cube.userData.planes.push(pl);
+      }
+    }
+
+    const hlInnerGeom = new THREE.EdgesGeometry(new THREE.BoxGeometry(cubeSize*1.06, cubeSize*1.06, cubeSize*1.06));
+    const hlOuterGeom = new THREE.EdgesGeometry(new THREE.BoxGeometry(cubeSize*1.18, cubeSize*1.18, cubeSize*1.18));
+    highlightInner = new THREE.LineSegments(hlInnerGeom, new THREE.LineBasicMaterial({ color: 0xffe28a }));
+    highlightOuter = new THREE.LineSegments(hlOuterGeom, new THREE.LineBasicMaterial({
+      color: 0xffd166, transparent: true, opacity: 0.35
+    }));
+    highlightInner.visible = false;
+    highlightOuter.visible = false;
+    group.add(highlightInner);
+    group.add(highlightOuter);
+  }
+
+  function setCellValue(cube, value) {
+    if (!cube || cube.userData.isGiven) return;
+    const prev = cube.userData.value;
+    cube.userData.value = value;
+    for (const pl of cube.userData.planes) cube.remove(pl);
+    cube.userData.planes.length = 0;
+    if (value !== 0) for (const f of cube.userData.faces) {
+      const pl = makeDigitPlane(value, false, f);
+      cube.add(pl);
+      cube.userData.planes.push(pl);
+    }
+    if (prev === 0 && value !== 0) userEntries++;
+    else if (prev !== 0 && value === 0) userEntries--;
+    if (cube === selectedCube) refreshSelected();
+    statsEl.innerHTML = api.statsHTML();
+  }
+
+  function flip(axis, dir) {
+    const snap = v => Math.round(v / (Math.PI/2)) * (Math.PI/2);
+    if (axis === 'x') targetRotX = snap(targetRotX) + dir * Math.PI/2;
+    else              targetRotY = snap(targetRotY) + dir * Math.PI/2;
+  }
+
+  const _tmpQuat = new THREE.Quaternion();
+  const _tmpEuler = new THREE.Euler();
+  function arrowMove(sx, sy, sz) {
+    if (!selectedCube) return;
+    _tmpEuler.set(targetRotX, targetRotY, 0, 'XYZ');
+    _tmpQuat.setFromEuler(_tmpEuler).invert();
+    const localDir = new THREE.Vector3(sx, sy, sz).applyQuaternion(_tmpQuat);
+    const ax = Math.abs(localDir.x), ay = Math.abs(localDir.y), az = Math.abs(localDir.z);
+    let di = 0, dj = 0, dk = 0;
+    if (ax >= ay && ax >= az)      di = Math.sign(localDir.x);
+    else if (ay >= az)             dj = Math.sign(localDir.y);
+    else                           dk = Math.sign(localDir.z);
+    moveSelected(di, dj, dk);
+  }
+  function moveSelected(di, dj, dk) {
+    if (!selectedCube || (di === 0 && dj === 0 && dk === 0)) return;
+    const { i, j, k } = selectedCube.userData;
+    const ni = i + di, nj = j + dj, nk = k + dk;
+    if (ni < 0 || ni >= N || nj < 0 || nj >= N || nk < 0 || nk >= N) return;
+    const other = grid[ni][nj][nk];
+    if (!other) return;
+    grid[i][j][k] = other;
+    grid[ni][nj][nk] = selectedCube;
+    other.userData.i = i; other.userData.j = j; other.userData.k = k;
+    selectedCube.userData.i = ni; selectedCube.userData.j = nj; selectedCube.userData.k = nk;
+    selectedCube.userData.targetPos = new THREE.Vector3(gridPos(ni), gridPos(nj), gridPos(nk));
+    other.userData.targetPos        = new THREE.Vector3(gridPos(i),  gridPos(j),  gridPos(k));
+    refreshSelected();
+  }
+
+  const api = {
+    name: 'Sudoku Cube',
+    subtitle: 'A 729-cell puzzle living in three dimensions (shell only).',
+    controlsHTML:
+      `<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>` +
+      `<kbd>right-drag</kbd> rotate &nbsp; <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> flip face<br>` +
+      `<kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> move &nbsp; <kbd>⇧</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> Z-axis &nbsp; <kbd>scroll</kbd> zoom`,
+    cameraDistance: 28,
+    drivesCamera: true, // cube manages its own zoom
+
+    install() {
+      build();
+      scene.add(group);
+    },
+    uninstall() {
+      if (selectedCube) {
+        selectedCube.material.emissive && selectedCube.material.emissive.setHex(0x000000);
+        selectedCube = null;
+      }
+      scene.remove(group);
+      disposeGroup(group);
+      group = null;
+      allCubes = [];
+      grid = null;
+    },
+    get pickables() { return allCubes; },
+    pick(hit) {
+      if (selectedCube && selectedCube.material.emissive) {
+        selectedCube.material.emissive.setHex(0x000000);
+        selectedCube.material.emissiveIntensity = 1;
+      }
+      selectedCube = hit ? hit.object : null;
+      if (selectedCube) {
+        selectedCube.material.emissive = new THREE.Color(0xffd166);
+        selectedCube.material.emissiveIntensity = 0.2;
+        highlightInner.visible = true;
+        highlightOuter.visible = true;
+      } else {
+        highlightInner.visible = false;
+        highlightOuter.visible = false;
+      }
+      refreshSelected();
+    },
+    clearPick() { this.pick(null); },
+    selectedInfoHTML() {
+      if (!selectedCube) return 'No cube selected';
+      const { i, j, k, isGiven, value } = selectedCube.userData;
+      const block = `(${Math.floor(i/3)+1}, ${Math.floor(j/3)+1}, ${Math.floor(k/3)+1})`;
+      let v;
+      if (value === 0)        v = '<span class="dim">empty</span>';
+      else if (isGiven)       v = `<span class="given">${value}</span> <span class="dim">(given)</span>`;
+      else                    v = `<span class="user">${value}</span>`;
+      return `<b>Selected cell</b> <span class="pill cell">Cell</span><br>` +
+             `<span class="dim">Cell</span> (${i+1}, ${j+1}, ${k+1})<br>` +
+             `<span class="dim">Sub-block</span> ${block}<br>` +
+             `<span class="dim">Value</span> ${v}`;
+    },
+    statsHTML() {
+      return `<span class="dim">cells</span> <span class="stat-num">${allCubes ? allCubes.length : 0}</span><br>` +
+             `<span class="dim">sub-blocks</span> <span class="stat-num">27</span><br>` +
+             `<span class="dim">given clues</span> <span class="stat-num">${givenCount}</span><br>` +
+             `<span class="dim">your entries</span> <span class="stat-num">${userEntries}</span>`;
+    },
+    // Cube uses its own rotation/zoom so it can flip-snap with WASD.
+    handleDrag(dx, dy) {
+      rotY += dx * 0.006; rotX += dy * 0.006;
+      targetRotX = rotX; targetRotY = rotY;
+    },
+    handleWheel(deltaY) {
+      zoom = Math.max(10, Math.min(70, zoom + deltaY * 0.02));
+    },
+    keydown(e) {
+      const k = e.key;
+      if (k === 'w' || k === 'W') { flip('x', -1); e.preventDefault(); return true; }
+      if (k === 's' || k === 'S') { flip('x',  1); e.preventDefault(); return true; }
+      if (k === 'a' || k === 'A') { flip('y', -1); e.preventDefault(); return true; }
+      if (k === 'd' || k === 'D') { flip('y',  1); e.preventDefault(); return true; }
+      if (k === 'ArrowUp')    { e.shiftKey ? arrowMove(0,0,-1) : arrowMove(0, 1,0); e.preventDefault(); return true; }
+      if (k === 'ArrowDown')  { e.shiftKey ? arrowMove(0,0, 1) : arrowMove(0,-1,0); e.preventDefault(); return true; }
+      if (k === 'ArrowLeft')  { arrowMove(-1,0,0); e.preventDefault(); return true; }
+      if (k === 'ArrowRight') { arrowMove( 1,0,0); e.preventDefault(); return true; }
+      if (k >= '1' && k <= '9') { setCellValue(selectedCube, parseInt(k)); e.preventDefault(); return true; }
+      if (k === '0' || k === 'Backspace' || k === 'Delete') { setCellValue(selectedCube, 0); e.preventDefault(); return true; }
+      return false;
+    },
+    frame(dt, t) {
+      _t = t;
+      rotX += (targetRotX - rotX) * 0.18;
+      rotY += (targetRotY - rotY) * 0.18;
+      group.rotation.x = rotX;
+      group.rotation.y = rotY;
+      for (const c of allCubes) c.position.lerp(c.userData.targetPos, 0.2);
+      if (selectedCube) {
+        highlightInner.position.copy(selectedCube.position);
+        highlightOuter.position.copy(selectedCube.position);
+        highlightOuter.material.opacity = 0.25 + 0.15 * Math.sin(_t * 3);
+      }
+      camera.position.set(0, 0, zoom);
+      camera.lookAt(0, 0, 0);
+
+      // Auto-pick most-upright in-plane orientation for each digit plane.
+      const _invQ = group.quaternion.clone().invert();
+      const _worldUpLocal = new THREE.Vector3(0, 1, 0).applyQuaternion(_invQ);
+      for (const c of allCubes) {
+        for (const pl of c.userData.planes) {
+          const f = pl.userData.face;
+          let bestK = 0, bestDot = -Infinity;
+          for (let kk = 0; kk < 4; kk++) {
+            const d = f.upCandidates[kk].dot(_worldUpLocal);
+            if (d > bestDot) { bestDot = d; bestK = kk; }
+          }
+          pl.quaternion.copy(f.quats[bestK]);
+        }
+      }
+    },
+  };
+  return api;
+}
+
+// ============================================================================
+//  COMMON POLYHEDRAL SHAPE BUILDER
+//  Used by kilominx (1 template) and megaminx/icosaminx (3 templates).
+//  Each polyhedron shape is just a configuration of build steps below.
+// ============================================================================
+
+// ============================================================================
+//  SHAPE 2 — SUDOKU KILOMINX  (60 kites, corners-only dodec)
+// ============================================================================
+function makeKilominxShape() {
+  let group = null;
+  let pieces = [];
+  let kiteGeom = null, kiteOutlineGeom = null, kiteHighlightGeom = null;
+  let selected = null;
+
+  function build() {
+    group = new THREE.Group();
+    pieces = [];
+    selected = null;
+    const sourceGeom = new THREE.DodecahedronGeometry(2.5);
+    const faces = extractPolyhedralFaces(sourceGeom);
+    sourceGeom.dispose();
+
+    // Kite template [C, mNext, V, mPrev] in face[0]'s local frame.
+    const f0 = faces[0];
+    const V0     = f0.verts[0];
+    const mPrev0 = new THREE.Vector3().addVectors(f0.verts[4], f0.verts[0]).multiplyScalar(0.5);
+    const mNext0 = new THREE.Vector3().addVectors(f0.verts[0], f0.verts[1]).multiplyScalar(0.5);
+    const xAxis0 = new THREE.Vector3().subVectors(V0, f0.center).normalize();
+    const zAxis0 = f0.normal.clone();
+    const yAxis0 = new THREE.Vector3().crossVectors(zAxis0, xAxis0).normalize();
+    const toLocal = p => {
+      const r = new THREE.Vector3().subVectors(p, f0.center);
+      return [r.dot(xAxis0), r.dot(yAxis0), r.dot(zAxis0)];
+    };
+    const Cl = [0, 0, 0];
+    const Nl = toLocal(mNext0);
+    const Vl = toLocal(V0);
+    const Pl = toLocal(mPrev0);
+    kiteGeom = new THREE.BufferGeometry();
+    kiteGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+      Cl[0], Cl[1], Cl[2],
+      Nl[0], Nl[1], Nl[2],
+      Vl[0], Vl[1], Vl[2],
+      Pl[0], Pl[1], Pl[2],
+    ]), 3));
+    kiteGeom.setIndex([0, 2, 1, 0, 3, 2]); // CCW from outside (kilominx convention)
+    kiteGeom.computeVertexNormals();
+    const pts2d = [[Cl[0],Cl[1]], [Nl[0],Nl[1]], [Vl[0],Vl[1]], [Pl[0],Pl[1]]];
+    kiteOutlineGeom   = makeOutlineGeom(pts2d, 0.022, 0.004);
+    kiteHighlightGeom = makeHighlightGeom(pts2d, 0.07, 0.008);
+
+    const baseMat = new THREE.MeshStandardMaterial({ color: 0x6a7fc8, roughness: 0.5, metalness: 0.08, flatShading: true });
+    for (const f of faces) {
+      for (let i = 0; i < 5; i++) {
+        const C = f.center;
+        const V = f.verts[i];
+        const xA = new THREE.Vector3().subVectors(V, C).normalize();
+        const zA = f.normal.clone();
+        const yA = new THREE.Vector3().crossVectors(zA, xA).normalize();
+        const M  = new THREE.Matrix4().makeBasis(xA, yA, zA).setPosition(C);
+        const piece = new THREE.Mesh(kiteGeom, baseMat.clone());
+        piece.applyMatrix4(M);
+        piece.userData = { type: 'kite', face: faces.indexOf(f), slot: i, outerVertex: V.clone() };
+        const outline = new THREE.Mesh(kiteOutlineGeom, POLY_OUTLINE_MAT);
+        outline.renderOrder = 1;
+        piece.add(outline);
+        group.add(piece);
+        pieces.push(piece);
+      }
+    }
+    // 3-sibling corner groups by outer vertex world coords.
+    const cornerByKey = new Map();
+    for (const p of pieces) {
+      const k = POLY_KEY(p.userData.outerVertex);
+      if (!cornerByKey.has(k)) cornerByKey.set(k, []);
+      cornerByKey.get(k).push(p);
+    }
+    let cornerIdx = 0;
+    for (const members of cornerByKey.values()) {
+      for (const p of members) { p.userData.corner = cornerIdx; p.userData.siblings = members; }
+      cornerIdx++;
+    }
+  }
+
+  const api = {
+    name: 'Sudoku Kilominx',
+    subtitle: '60 kite pieces tiling a dodecahedron (corners only).',
+    controlsHTML: '<kbd>left-click</kbd> select piece &nbsp; <kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
+    cameraDistance: 9,
+    install() { build(); scene.add(group); },
+    uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; },
+    get pickables() { return pieces; },
+    pick(hit) {
+      if (selected) for (const m of selected) {
+        m.material.emissive.setHex(0x000000); m.material.emissiveIntensity = 1;
+        if (m.userData.highlight) { m.remove(m.userData.highlight); m.userData.highlight = null; }
+      }
+      selected = hit ? hit.object.userData.siblings : null;
+      if (selected) for (const m of selected) {
+        m.material.emissive = new THREE.Color(0xffd166);
+        m.material.emissiveIntensity = 0.25;
+        const hl = new THREE.LineSegments(kiteHighlightGeom, POLY_HL_MAT);
+        hl.renderOrder = 2;
+        m.add(hl); m.userData.highlight = hl;
+      }
+      refreshSelected();
+    },
+    clearPick() { this.pick(null); },
+    selectedInfoHTML() {
+      if (!selected) return 'No piece selected';
+      const cornerIdx = selected[0].userData.corner;
+      const faces = selected.map(m => m.userData.face + 1).sort((a, b) => a - b);
+      return `<b>Selected corner</b> <span class="pill kite">Kite</span><br>` +
+             `<span class="dim">Corner</span> ${cornerIdx + 1} <span class="dim">/ 20</span><br>` +
+             `<span class="dim">Touches faces</span> ${faces.join(', ')}`;
+    },
+    statsHTML() {
+      return `<span class="dim">corners</span> <span class="stat-num">20</span><br>` +
+             `<span class="dim">stickers</span> <span class="stat-num">60</span><br>` +
+             `<span class="dim">faces</span> <span class="stat-num">12</span>`;
+    },
+  };
+  return api;
+}
+
+// ============================================================================
+//  GENERIC MEGA/ICOSA BUILDER
+//  Both shapes share the same 1 center + 3-or-5 corners + 3-or-5 edges pattern.
+//  Only the source polyhedron and per-face vertex count differ.
+// ============================================================================
+function makeMinxLikeShape(opts) {
+  // opts: { name, subtitle, sourceGeomFactory, totals, statLines, centerLabel }
+  // totals: { center, edge, corner }
+  // statLines: array of [label, value] for the stats panel
+  let group = null;
+  let pieces = [];
+  let selected = null;
+  let centerGeom = null, centerOutlineGeom = null, centerHighlightGeom = null;
+  let edgeGeom = null, edgeOutlineGeom = null, edgeHighlightGeom = null;
+  let cornerGeom = null, cornerOutlineGeom = null, cornerHighlightGeom = null;
+
+  function build() {
+    group = new THREE.Group();
+    pieces = [];
+    selected = null;
+
+    const sourceGeom = opts.sourceGeomFactory();
+    const faces = extractPolyhedralFaces(sourceGeom);
+    sourceGeom.dispose();
+
+    const N_VERTS = faces[0].verts.length; // 3 (icos triangle) or 5 (dodec pentagon)
+    const INNER_SCALE = 0.42;
+    const CORNER_FRAC = 0.34;
+
+    const f0 = faces[0];
+    const C0 = f0.center;
+    const V0_world = f0.verts[0];
+    const xAxis0 = new THREE.Vector3().subVectors(V0_world, C0).normalize();
+    const zAxis0 = f0.normal.clone();
+    const yAxis0 = new THREE.Vector3().crossVectors(zAxis0, xAxis0).normalize();
+    const toLocal = p => {
+      const r = new THREE.Vector3().subVectors(p, C0);
+      return [r.dot(xAxis0), r.dot(yAxis0), r.dot(zAxis0)];
+    };
+    const R_outer = new THREE.Vector3().subVectors(V0_world, C0).length();
+
+    // -- CENTER template
+    const centerPts = [];
+    for (let i = 0; i < N_VERTS; i++) {
+      const ang = (2 * Math.PI / N_VERTS) * i;
+      centerPts.push([INNER_SCALE * R_outer * Math.cos(ang),
+                      INNER_SCALE * R_outer * Math.sin(ang)]);
+    }
+    centerGeom = new THREE.BufferGeometry();
+    const cPos = new Float32Array(centerPts.length * 3);
+    for (let i = 0; i < centerPts.length; i++) {
+      cPos[i*3+0] = centerPts[i][0]; cPos[i*3+1] = centerPts[i][1]; cPos[i*3+2] = 0;
+    }
+    centerGeom.setAttribute('position', new THREE.BufferAttribute(cPos, 3));
+    // Fan triangulation from vertex 0 (works for any convex polygon).
+    const cIdx = [];
+    for (let i = 1; i < N_VERTS - 1; i++) cIdx.push(0, i, i + 1);
+    centerGeom.setIndex(cIdx);
+    centerGeom.computeVertexNormals();
+    centerOutlineGeom   = makeOutlineGeom(centerPts, 0.022, 0.004);
+    centerHighlightGeom = makeHighlightGeom(centerPts, 0.10, 0.008);
+
+    // -- CORNER template [W, A, V, B]
+    {
+      const Vw    = f0.verts[0];
+      const Vprev = f0.verts[(0 - 1 + N_VERTS) % N_VERTS];
+      const Vnext = f0.verts[1];
+      const W = new THREE.Vector3().subVectors(Vw, C0).multiplyScalar(INNER_SCALE).add(C0);
+      const A = new THREE.Vector3().lerpVectors(Vw, Vprev, CORNER_FRAC);
+      const B = new THREE.Vector3().lerpVectors(Vw, Vnext, CORNER_FRAC);
+      const lW = toLocal(W), lA = toLocal(A), lV = toLocal(Vw), lB = toLocal(B);
+      const cornerPts = [[lW[0],lW[1]], [lA[0],lA[1]], [lV[0],lV[1]], [lB[0],lB[1]]];
+      cornerGeom = new THREE.BufferGeometry();
+      cornerGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+        lW[0],lW[1],0,  lA[0],lA[1],0,  lV[0],lV[1],0,  lB[0],lB[1],0,
+      ]), 3));
+      cornerGeom.setIndex([0,1,2, 0,2,3]);
+      cornerGeom.computeVertexNormals();
+      cornerOutlineGeom   = makeOutlineGeom(cornerPts, 0.022, 0.004);
+      cornerHighlightGeom = makeHighlightGeom(cornerPts, 0.10, 0.008);
+    }
+
+    // -- EDGE template [W_i, B_i, A_{i+1}, W_{i+1}] anchored at edge midpoint
+    {
+      const Vi   = f0.verts[0];
+      const Vi1  = f0.verts[1];
+      const Wi   = new THREE.Vector3().subVectors(Vi,  C0).multiplyScalar(INNER_SCALE).add(C0);
+      const Wi1  = new THREE.Vector3().subVectors(Vi1, C0).multiplyScalar(INNER_SCALE).add(C0);
+      const Bi   = new THREE.Vector3().lerpVectors(Vi,  Vi1, CORNER_FRAC);
+      const Ai1  = new THREE.Vector3().lerpVectors(Vi1, Vi,  CORNER_FRAC);
+      const Medge = new THREE.Vector3().addVectors(Vi, Vi1).multiplyScalar(0.5);
+      const xAxisE = new THREE.Vector3().subVectors(Medge, C0).normalize();
+      const yAxisE = new THREE.Vector3().crossVectors(zAxis0, xAxisE).normalize();
+      const toLocalE = p => {
+        const r = new THREE.Vector3().subVectors(p, C0);
+        return [r.dot(xAxisE), r.dot(yAxisE), r.dot(zAxis0)];
+      };
+      const lWi=toLocalE(Wi), lBi=toLocalE(Bi), lAi1=toLocalE(Ai1), lWi1=toLocalE(Wi1);
+      const edgePts = [[lWi[0],lWi[1]], [lBi[0],lBi[1]], [lAi1[0],lAi1[1]], [lWi1[0],lWi1[1]]];
+      edgeGeom = new THREE.BufferGeometry();
+      edgeGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+        lWi[0],lWi[1],0,  lBi[0],lBi[1],0,  lAi1[0],lAi1[1],0,  lWi1[0],lWi1[1],0,
+      ]), 3));
+      edgeGeom.setIndex([0,1,2, 0,2,3]);
+      edgeGeom.computeVertexNormals();
+      edgeOutlineGeom   = makeOutlineGeom(edgePts, 0.022, 0.004);
+      edgeHighlightGeom = makeHighlightGeom(edgePts, 0.10, 0.008);
+    }
+
+    const centerMat = new THREE.MeshStandardMaterial({ color: opts.colors.center, roughness: 0.5, metalness: 0.08, flatShading: true });
+    const edgeMat   = new THREE.MeshStandardMaterial({ color: opts.colors.edge,   roughness: 0.5, metalness: 0.08, flatShading: true });
+    const cornerMat = new THREE.MeshStandardMaterial({ color: opts.colors.corner, roughness: 0.5, metalness: 0.08, flatShading: true });
+
+    for (let fi = 0; fi < faces.length; fi++) {
+      const f = faces[fi];
+      const C = f.center, n = f.normal;
+
+      // center
+      {
+        const xA = new THREE.Vector3().subVectors(f.verts[0], C).normalize();
+        const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+        const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
+        const piece = new THREE.Mesh(centerGeom, centerMat.clone());
+        piece.applyMatrix4(M);
+        piece.userData = { type: 'center', face: fi, groupKey: `C${fi}` };
+        const outline = new THREE.Mesh(centerOutlineGeom, POLY_OUTLINE_MAT);
+        outline.renderOrder = 1; piece.add(outline);
+        group.add(piece); pieces.push(piece);
+      }
+      // corners
+      for (let i = 0; i < N_VERTS; i++) {
+        const V = f.verts[i];
+        const xA = new THREE.Vector3().subVectors(V, C).normalize();
+        const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+        const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
+        const piece = new THREE.Mesh(cornerGeom, cornerMat.clone());
+        piece.applyMatrix4(M);
+        piece.userData = { type: 'corner', face: fi, slot: i, groupKey: `V${POLY_KEY(V)}` };
+        const outline = new THREE.Mesh(cornerOutlineGeom, POLY_OUTLINE_MAT);
+        outline.renderOrder = 1; piece.add(outline);
+        group.add(piece); pieces.push(piece);
+      }
+      // edges
+      for (let i = 0; i < N_VERTS; i++) {
+        const Vi = f.verts[i], Vi1 = f.verts[(i+1) % N_VERTS];
+        const Mp = new THREE.Vector3().addVectors(Vi, Vi1).multiplyScalar(0.5);
+        const xA = new THREE.Vector3().subVectors(Mp, C).normalize();
+        const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+        const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
+        const piece = new THREE.Mesh(edgeGeom, edgeMat.clone());
+        piece.applyMatrix4(M);
+        piece.userData = { type: 'edge', face: fi, slot: i, groupKey: `E${POLY_KEY(Mp)}` };
+        const outline = new THREE.Mesh(edgeOutlineGeom, POLY_OUTLINE_MAT);
+        outline.renderOrder = 1; piece.add(outline);
+        group.add(piece); pieces.push(piece);
+      }
+    }
+
+    // Sibling grouping by world-space key.
+    const groupMap = new Map();
+    for (const p of pieces) {
+      const k = p.userData.groupKey;
+      if (!groupMap.has(k)) groupMap.set(k, []);
+      groupMap.get(k).push(p);
+    }
+    const counters = { center: 0, edge: 0, corner: 0 };
+    for (const members of groupMap.values()) {
+      const type = members[0].userData.type;
+      const gi = counters[type]++;
+      for (const m of members) { m.userData.siblings = members; m.userData.groupIndex = gi; }
+    }
+  }
+
+  const TYPE_LABEL = { center: 'Center', edge: 'Edge', corner: 'Corner' };
+  const HL_BY_TYPE = () => ({ center: centerHighlightGeom, edge: edgeHighlightGeom, corner: cornerHighlightGeom });
+
+  const api = {
+    name: opts.name,
+    subtitle: opts.subtitle,
+    controlsHTML: '<kbd>left-click</kbd> select piece &nbsp; <kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
+    cameraDistance: 9,
+    install() { build(); scene.add(group); },
+    uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; },
+    get pickables() { return pieces; },
+    pick(hit) {
+      if (selected) for (const m of selected) {
+        m.material.emissive.setHex(0x000000); m.material.emissiveIntensity = 1;
+        if (m.userData.highlight) { m.remove(m.userData.highlight); m.userData.highlight = null; }
+      }
+      selected = hit ? hit.object.userData.siblings : null;
+      if (selected) {
+        const hlGeom = HL_BY_TYPE()[selected[0].userData.type];
+        for (const m of selected) {
+          m.material.emissive = new THREE.Color(0xffd166);
+          m.material.emissiveIntensity = 0.28;
+          const hl = new THREE.LineSegments(hlGeom, POLY_HL_MAT);
+          hl.renderOrder = 2;
+          m.add(hl); m.userData.highlight = hl;
+        }
+      }
+      refreshSelected();
+    },
+    clearPick() { this.pick(null); },
+    selectedInfoHTML() {
+      if (!selected) return 'No piece selected';
+      const first = selected[0];
+      const type = first.userData.type;
+      const gi = first.userData.groupIndex;
+      const faces = selected.map(m => m.userData.face + 1).sort((a, b) => a - b);
+      return `<b>Selected piece</b> <span class="pill ${type}">${TYPE_LABEL[type]}</span><br>` +
+             `<span class="dim">${TYPE_LABEL[type]}</span> ${gi + 1} <span class="dim">/ ${opts.totals[type]}</span><br>` +
+             `<span class="dim">Stickers</span> ${selected.length}<br>` +
+             `<span class="dim">${faces.length > 1 ? 'Touches faces' : 'On face'}</span> ${faces.join(', ')}`;
+    },
+    statsHTML() {
+      return opts.statLines.map(([label, val]) =>
+        `<span class="dim">${label}</span> <span class="stat-num">${val}</span>`
+      ).join('<br>');
+    },
+  };
+  return api;
+}
+
+// ============================================================================
+//  REGISTER ALL SHAPES
+// ============================================================================
+SHAPES.push(makeCubeShape());
+
+SHAPES.push(makeKilominxShape());
+
+SHAPES.push(makeMinxLikeShape({
+  name: 'Sudoku Megaminx',
+  subtitle: '132 stickers across 62 pieces on a dodecahedron.',
+  sourceGeomFactory: () => new THREE.DodecahedronGeometry(2.5),
+  totals: { center: 12, edge: 30, corner: 20 },
+  statLines: [['centers', 12], ['edges', 30], ['corners', 20], ['stickers', 132]],
+  colors: { center: 0xd4a766, edge: 0x6a7fc8, corner: 0x9f76e0 },
+}));
+
+SHAPES.push(makeMinxLikeShape({
+  name: 'Sudoku Icosaminx',
+  subtitle: '140 stickers across 62 pieces on an icosahedron.',
+  sourceGeomFactory: () => new THREE.IcosahedronGeometry(2.5, 0),
+  totals: { center: 20, edge: 30, corner: 12 },
+  statLines: [['centers', 20], ['edges', 30], ['corners', 12], ['stickers', 140]],
+  colors: { center: 0x66c8a7, edge: 0x6a7fc8, corner: 0xe0769e },
+}));
+
+// ============================================================================
+//  INPUT — shared across all shapes
+// ============================================================================
+let rotating = false, px = 0, py = 0;
+let downX = 0, downY = 0, downBtn = -1;
+renderer.domElement.addEventListener('mousedown', e => {
+  downX = e.clientX; downY = e.clientY; downBtn = e.button;
+  if (e.button === 2) { rotating = true; px = e.clientX; py = e.clientY; }
+});
+window.addEventListener('mousemove', e => {
+  if (!rotating || !activeShape) return;
+  const dx = e.clientX - px, dy = e.clientY - py;
+  if (activeShape.handleDrag) {
+    activeShape.handleDrag(dx, dy);
+  } else if (activeShape.install) {
+    // Polyhedral shapes: rotate their root group directly via scene traversal.
+    const g = scene.children.find(o => o.type === 'Group');
+    if (g) { g.rotation.y += dx * 0.006; g.rotation.x += dy * 0.006; }
+  }
+  px = e.clientX; py = e.clientY;
+});
+window.addEventListener('mouseup', e => {
+  if (e.button === 2) rotating = false;
+  if (e.button === 0 && downBtn === 0 && activeShape) {
+    const dx = e.clientX - downX, dy = e.clientY - downY;
+    if (Math.hypot(dx, dy) < 5) pickAt(e.clientX, e.clientY);
+  }
+  downBtn = -1;
+});
+
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+function pickAt(clientX, clientY) {
+  if (!activeShape) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.x =  ((clientX - rect.left) / rect.width)  * 2 - 1;
+  ndc.y = -((clientY - rect.top)  / rect.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObjects(activeShape.pickables, false);
+  activeShape.pick(hits.length > 0 ? hits[0] : null);
+}
+
+renderer.domElement.addEventListener('wheel', e => {
+  if (!activeShape) return;
+  if (activeShape.handleWheel) {
+    activeShape.handleWheel(e.deltaY);
+  } else {
+    camera.position.z *= e.deltaY > 0 ? 1.08 : 1 / 1.08;
+    camera.position.z = Math.max(4, Math.min(30, camera.position.z));
+  }
+  e.preventDefault();
+}, { passive: false });
+
+window.addEventListener('keydown', e => {
+  // Shape navigation — only when active shape doesn't consume the key.
+  if (e.key === '[') { switchToShape(activeShapeIndex - 1); e.preventDefault(); return; }
+  if (e.key === ']') { switchToShape(activeShapeIndex + 1); e.preventDefault(); return; }
+  if (activeShape && activeShape.keydown) activeShape.keydown(e);
+});
+
+document.getElementById('navPrev').addEventListener('click', () => switchToShape(activeShapeIndex - 1));
+document.getElementById('navNext').addEventListener('click', () => switchToShape(activeShapeIndex + 1));
+
+// ============================================================================
+//  RENDER LOOP
+// ============================================================================
+let lastT = performance.now();
+(function loop() {
+  requestAnimationFrame(loop);
+  const now = performance.now();
+  const dt = (now - lastT) / 1000;
+  lastT = now;
+  const t = now / 1000;
+  if (activeShape && activeShape.frame) activeShape.frame(dt, t);
+  renderer.render(scene, camera);
+})();
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// Boot.
+switchToShape(0);
+</script>
+</body>
+</html>
