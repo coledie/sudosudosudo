@@ -140,33 +140,85 @@ function makeRoundedBox(size, radius, segments = 4) {
   return geo;
 }
 
-// --- number textures (canvas) ---
-function makeNumberTexture(num, color) {
+// --- number plane textures (transparent bg, used as decals on cube faces) ---
+function makeNumberSpriteTexture(num, color) {
   const c = document.createElement('canvas');
   c.width = c.height = 128;
   const g = c.getContext('2d');
-  g.fillStyle = '#fafafa';
-  g.fillRect(0, 0, 128, 128);
-  if (num) {
-    g.shadowColor = 'rgba(20, 15, 40, 0.25)';
-    g.shadowBlur = 5;
-    g.shadowOffsetY = 2;
-    g.fillStyle = color;
-    g.font = '700 90px "SF Pro Display", -apple-system, system-ui, "Helvetica Neue", Arial, sans-serif';
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    g.fillText(String(num), 64, 70);
-  }
+  // transparent background — the cube color shows through
+  g.shadowColor = 'rgba(0, 0, 0, 0.55)';
+  g.shadowBlur = 8;
+  g.shadowOffsetY = 2;
+  g.fillStyle = color;
+  g.font = '800 96px "SF Pro Display", -apple-system, system-ui, "Helvetica Neue", Arial, sans-serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText(String(num), 64, 70);
   const tex = new THREE.CanvasTexture(c);
   tex.anisotropy = 8;
   tex.encoding = THREE.sRGBEncoding;
   return tex;
 }
-const blankTexture = makeNumberTexture(0, '');
-const givenTextures = {}, userTextures = {};
+const givenPlaneMats = {}, userPlaneMats = {};
 for (let n = 1; n <= 9; n++) {
-  givenTextures[n] = makeNumberTexture(n, '#1a1230');
-  userTextures[n]  = makeNumberTexture(n, '#1d4d9c');
+  givenPlaneMats[n] = new THREE.MeshBasicMaterial({
+    map: makeNumberSpriteTexture(n, '#fff2c8'),
+    transparent: true, depthWrite: false,
+  });
+  userPlaneMats[n] = new THREE.MeshBasicMaterial({
+    map: makeNumberSpriteTexture(n, '#bfe0ff'),
+    transparent: true, depthWrite: false,
+  });
+}
+const PLANE_SIZE = 0.82;
+const PLANE_OFFSET = 0.501; // just outside the cube face to avoid z-fighting
+const digitPlaneGeom = new THREE.PlaneGeometry(PLANE_SIZE, PLANE_SIZE);
+// Six face descriptors: outward normal + a fixed local "up" axis. Up choices
+// keep the digit reading right-side-up when the cube is in its default pose,
+// and snap to 90° cube-axis orientations rather than free-rotating.
+const FACE_DIRS = [
+  { axis: 'x', sign: +1, normal: new THREE.Vector3( 1, 0, 0), up: new THREE.Vector3(0, 1, 0) },
+  { axis: 'x', sign: -1, normal: new THREE.Vector3(-1, 0, 0), up: new THREE.Vector3(0, 1, 0) },
+  { axis: 'y', sign: +1, normal: new THREE.Vector3( 0, 1, 0), up: new THREE.Vector3(0, 0, 1) },
+  { axis: 'y', sign: -1, normal: new THREE.Vector3( 0,-1, 0), up: new THREE.Vector3(0, 0,-1) },
+  { axis: 'z', sign: +1, normal: new THREE.Vector3( 0, 0, 1), up: new THREE.Vector3(0, 1, 0) },
+  { axis: 'z', sign: -1, normal: new THREE.Vector3( 0, 0,-1), up: new THREE.Vector3(0, 1, 0) },
+];
+// Pre-bake each face's 4 in-plane orientations (0/90/180/270° around the face
+// normal). Each frame we pick whichever of these 4 puts the digit most
+// upright for the current camera angle.
+const _PI2 = Math.PI / 2;
+for (const f of FACE_DIRS) {
+  const right = new THREE.Vector3().crossVectors(f.up, f.normal).normalize();
+  const up    = new THREE.Vector3().crossVectors(f.normal, right).normalize();
+  const basis = new THREE.Matrix4().makeBasis(right, up, f.normal);
+  const base  = new THREE.Quaternion().setFromRotationMatrix(basis);
+  f.quats = [0, 1, 2, 3].map(k => {
+    const spin = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), k * _PI2);
+    return base.clone().multiply(spin);
+  });
+  // Each plane's +Y axis expressed in cube-local space for the 4 rotations.
+  f.upCandidates = f.quats.map(q => new THREE.Vector3(0, 1, 0).applyQuaternion(q));
+  f.quat = f.quats[0];
+}
+function makeDigitPlane(value, isGiven, face) {
+  const mat = (isGiven ? givenPlaneMats : userPlaneMats)[value];
+  const m = new THREE.Mesh(digitPlaneGeom, mat);
+  m.renderOrder = 2;
+  m.position.copy(face.normal).multiplyScalar(PLANE_OFFSET);
+  m.quaternion.copy(face.quat);
+  m.userData.face = face;
+  return m;
+}
+function outerFacesFor(i, j, k) {
+  const out = [];
+  if (i === 0)     out.push(FACE_DIRS[1]);
+  if (i === N - 1) out.push(FACE_DIRS[0]);
+  if (j === 0)     out.push(FACE_DIRS[3]);
+  if (j === N - 1) out.push(FACE_DIRS[2]);
+  if (k === 0)     out.push(FACE_DIRS[5]);
+  if (k === N - 1) out.push(FACE_DIRS[4]);
+  return out;
 }
 
 // --- palette: 27 jewel tones across cool→warm spectrum ---
@@ -183,8 +235,8 @@ function blockColor(i, j, k) {
 const cubeGroup = new THREE.Group();
 const N = 9;
 const cubeSize = 1;
-const gap = 0.06;
-const blockGap = 0.35;
+const gap = 0;
+const blockGap = 0;
 
 const total = N * cubeSize + (N - 1) * gap + 2 * blockGap;
 const start = -total / 2 + cubeSize / 2;
@@ -193,7 +245,12 @@ function gridPos(i) {
 }
 
 // shared rounded geometry → 729 cubes reuse the same vertex buffer
-const geom = makeRoundedBox(cubeSize, 0.12, 4);
+const geom = new THREE.BoxGeometry(cubeSize, cubeSize, cubeSize);
+// shared edges geometry for per-cube outline (line separators between minis)
+const edgesGeom = new THREE.EdgesGeometry(geom);
+const edgesMat = new THREE.LineBasicMaterial({
+  color: 0x0a0816, transparent: true, opacity: 0.65,
+});
 
 const grid = Array.from({length: N}, () => Array.from({length: N}, () => Array(N).fill(null)));
 const allCubes = [];
@@ -204,15 +261,19 @@ let givenCount = 0;
 for (let i = 0; i < N; i++) {
   for (let j = 0; j < N; j++) {
     for (let k = 0; k < N; k++) {
+      // Skip interior cells — only build the outer shell of the 9³ cube.
+      // An "inner" cell is one not touching any face: i,j,k all in 1..N-2.
+      const isShell = (i === 0 || i === N - 1 ||
+                       j === 0 || j === N - 1 ||
+                       k === 0 || k === N - 1);
+      if (!isShell) continue;
       const baseColor = blockColor(i, j, k);
       const isGiven = Math.random() < GIVEN_PROBABILITY;
       const value   = isGiven ? Math.floor(Math.random() * 9) + 1 : 0;
       if (isGiven) givenCount++;
-      const texture = isGiven ? givenTextures[value] : blankTexture;
 
       const mat = new THREE.MeshStandardMaterial({
         color: baseColor,
-        map: texture,
         metalness: 0.08,
         roughness: 0.42,
       });
@@ -220,10 +281,20 @@ for (let i = 0; i < N; i++) {
       const cube = new THREE.Mesh(geom, mat);
       const p = new THREE.Vector3(gridPos(i), gridPos(j), gridPos(k));
       cube.position.copy(p);
-      cube.userData = { i, j, k, targetPos: p.clone(), isGiven, value };
+      const faces = outerFacesFor(i, j, k);
+      cube.userData = { i, j, k, targetPos: p.clone(), isGiven, value, planes: [], faces };
       cubeGroup.add(cube);
       allCubes.push(cube);
       grid[i][j][k] = cube;
+      // black outline overlay for visible separators between cubes
+      cube.add(new THREE.LineSegments(edgesGeom, edgesMat));
+      if (value !== 0) {
+        for (const f of faces) {
+          const pl = makeDigitPlane(value, isGiven, f);
+          cube.add(pl);
+          cube.userData.planes.push(pl);
+        }
+      }
     }
   }
 }
@@ -285,8 +356,15 @@ function setCellValue(cube, value) {
   if (!cube || cube.userData.isGiven) return;
   const prev = cube.userData.value;
   cube.userData.value = value;
-  cube.material.map = value === 0 ? blankTexture : userTextures[value];
-  cube.material.needsUpdate = true;
+  for (const pl of cube.userData.planes) cube.remove(pl);
+  cube.userData.planes.length = 0;
+  if (value !== 0) {
+    for (const f of cube.userData.faces) {
+      const pl = makeDigitPlane(value, false, f);
+      cube.add(pl);
+      cube.userData.planes.push(pl);
+    }
+  }
   if (prev === 0 && value !== 0) userEntries++;
   else if (prev !== 0 && value === 0) userEntries--;
   statUserEl.textContent = userEntries;
@@ -387,6 +465,7 @@ function moveSelected(di, dj, dk) {
   const ni = i + di, nj = j + dj, nk = k + dk;
   if (ni < 0 || ni >= N || nj < 0 || nj >= N || nk < 0 || nk >= N) return;
   const other = grid[ni][nj][nk];
+  if (!other) return; // destination is interior (trimmed) — nothing to swap with
   grid[i][j][k] = other;
   grid[ni][nj][nk] = selectedCube;
   other.userData.i = i; other.userData.j = j; other.userData.k = k;
@@ -429,6 +508,23 @@ function animate() {
 
   camera.position.set(0, 0, zoom);
   camera.lookAt(0, 0, 0);
+
+  // For each digit plane, pick whichever of its 4 cube-aligned 90° orientations
+  // currently reads most upright from the camera's point of view.
+  const _invQ = cubeGroup.quaternion.clone().invert();
+  const _worldUpLocal = new THREE.Vector3(0, 1, 0).applyQuaternion(_invQ);
+  for (const c of allCubes) {
+    for (const pl of c.userData.planes) {
+      const f = pl.userData.face;
+      let bestK = 0, bestDot = -Infinity;
+      for (let k = 0; k < 4; k++) {
+        const d = f.upCandidates[k].dot(_worldUpLocal);
+        if (d > bestDot) { bestDot = d; bestK = k; }
+      }
+      pl.quaternion.copy(f.quats[bestK]);
+    }
+  }
+
   renderer.render(scene, camera);
 }
 animate();
