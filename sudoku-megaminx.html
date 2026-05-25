@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sudoku Megaminx</title>
+<style>
+  body {
+    margin: 0; overflow: hidden;
+    background: radial-gradient(ellipse at 50% 38%, #1e1640 0%, #0c0a20 45%, #050410 100%);
+    font-family: -apple-system, "SF Pro Display", system-ui, sans-serif;
+    color: #e8e8f0;
+  }
+  .panel {
+    position: absolute;
+    padding: 12px 16px;
+    background: rgba(12, 10, 24, 0.55);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+    user-select: none;
+    font-size: 13px; line-height: 1.55;
+  }
+  #info     { top: 16px;    left: 16px; max-width: 340px; }
+  #stats    { top: 16px;    right: 16px; text-align: right; }
+  #selected { bottom: 16px; left: 16px;  min-width: 240px; }
+  b { color: #ffd166; font-weight: 600; letter-spacing: 0.02em; }
+  kbd {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.12);
+    padding: 2px 7px; border-radius: 5px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px; color: #e8e8f0;
+  }
+  .dim { opacity: 0.6; }
+  .stat-num { font-size: 18px; font-weight: 600; color: #ffd166; }
+  .pill {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .pill.center { background: rgba(212,167,102,0.18); color: #f0c98a; }
+  .pill.edge   { background: rgba(106,127,200,0.20); color: #aebef5; }
+  .pill.corner { background: rgba(159,118,224,0.22); color: #cbb0f8; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="info" class="panel">
+  <b>Sudoku Megaminx</b><br>
+  <span class="dim">132 stickers across 62 pieces on a dodecahedron.</span><br><br>
+  <kbd>left-click</kbd> select piece &nbsp; <kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom
+</div>
+<div id="stats" class="panel">
+  <span class="dim">centers</span> <span class="stat-num">12</span><br>
+  <span class="dim">edges</span> <span class="stat-num">30</span><br>
+  <span class="dim">corners</span> <span class="stat-num">20</span><br>
+  <span class="dim">stickers</span> <span class="stat-num">132</span>
+</div>
+<div id="selected" class="panel">No piece selected</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 0, 9);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x000000, 0);
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0xb8c4ff, 0x2a1f3a, 0.6));
+const key = new THREE.DirectionalLight(0xffe4c0, 0.9); key.position.set(8, 14, 12); scene.add(key);
+const rim = new THREE.DirectionalLight(0x88a8ff, 0.5); rim.position.set(-12, -2, -8); scene.add(rim);
+
+// Three base materials — one per piece type. Per-instance .clone() at placement
+// so emissive tints on selection stay local to the selected piece's siblings.
+const centerBaseMat = new THREE.MeshStandardMaterial({ color: 0xd4a766, roughness: 0.50, metalness: 0.10, flatShading: true });
+const edgeBaseMat   = new THREE.MeshStandardMaterial({ color: 0x6a7fc8, roughness: 0.50, metalness: 0.08, flatShading: true });
+const cornerBaseMat = new THREE.MeshStandardMaterial({ color: 0x9f76e0, roughness: 0.50, metalness: 0.08, flatShading: true });
+
+// DodecahedronGeometry is used purely as a source of face data — never added.
+const sourceGeom = new THREE.DodecahedronGeometry(2.5);
+
+const dod = new THREE.Group();
+scene.add(dod);
+
+const pieces = []; // all 132 sticker meshes, exposed for picking
+
+// --- shared template geometries (built once, referenced by all instances) ---
+let centerGeom = null, centerOutlineGeom = null, centerHighlightGeom = null;
+let edgeGeom   = null, edgeOutlineGeom   = null, edgeHighlightGeom   = null;
+let cornerGeom = null, cornerOutlineGeom = null, cornerHighlightGeom = null;
+
+// Visible cut "ink": dark stripes along each piece's perimeter so neighbors
+// read as distinct stickers even when bodies tile flush.
+const outlineMat = new THREE.MeshBasicMaterial({
+  color: 0x07060f, side: THREE.DoubleSide,
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+});
+const highlightMat = new THREE.LineBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.95 });
+
+// ----- generic helpers (closed polygon of [x,y] points in local face plane) -----
+
+// Build a thin quad-strip outline around a closed polygon, lifted slightly in +Z.
+// WebGL's LineBasicMaterial.linewidth is ignored, so we draw real triangles.
+function makeOutlineGeom(pts2d, halfW, lift) {
+  const pos = [], idx = [];
+  let vi = 0;
+  for (let i = 0; i < pts2d.length; i++) {
+    const a = pts2d[i], b = pts2d[(i + 1) % pts2d.length];
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len * halfW, ny = dx / len * halfW;
+    pos.push(
+      a[0] + nx, a[1] + ny, lift,
+      a[0] - nx, a[1] - ny, lift,
+      b[0] + nx, b[1] + ny, lift,
+      b[0] - nx, b[1] - ny, lift,
+    );
+    idx.push(vi, vi + 1, vi + 2,  vi + 1, vi + 3, vi + 2);
+    vi += 4;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+  g.setIndex(idx);
+  return g;
+}
+
+// Build a LineSegments edge loop shrunk toward the polygon's own centroid.
+// Used for the selection highlight rim — sits cleanly inside each piece.
+function makeHighlightGeom(pts2d, shrink, lift) {
+  let cx = 0, cy = 0;
+  for (const p of pts2d) { cx += p[0]; cy += p[1]; }
+  cx /= pts2d.length; cy /= pts2d.length;
+  const sp = pts2d.map(p => [cx + (p[0] - cx) * (1 - shrink), cy + (p[1] - cy) * (1 - shrink)]);
+  const pos = [];
+  for (let i = 0; i < sp.length; i++) {
+    const a = sp[i], b = sp[(i + 1) % sp.length];
+    pos.push(a[0], a[1], lift, b[0], b[1], lift);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+  return g;
+}
+
+// ============================================================================
+//  BUILD
+// ============================================================================
+(function buildMegaminxPieces() {
+  // ---- 1) Read all triangles out of the source geometry. ----
+  const pos = sourceGeom.attributes.position;
+  const triCount = pos.count / 3;
+  const tris = [];
+  for (let t = 0; t < triCount; t++) {
+    const v0 = new THREE.Vector3().fromBufferAttribute(pos, t * 3 + 0);
+    const v1 = new THREE.Vector3().fromBufferAttribute(pos, t * 3 + 1);
+    const v2 = new THREE.Vector3().fromBufferAttribute(pos, t * 3 + 2);
+    const n = new THREE.Vector3().subVectors(v1, v0)
+                .cross(new THREE.Vector3().subVectors(v2, v0))
+                .normalize();
+    tris.push({ vs: [v0, v1, v2], n });
+  }
+
+  // ---- 2) Group triangles into 12 coplanar groups (one per pentagonal face). ----
+  const FACE_TOL = 0.01;
+  const faces = [];
+  for (const t of tris) {
+    let f = faces.find(ff => ff.normal.dot(t.n) > 1 - FACE_TOL);
+    if (!f) { f = { normal: t.n.clone(), tris: [] }; faces.push(f); }
+    f.tris.push(t);
+  }
+
+  // ---- 3) For each face, get its 5 unique vertices sorted CCW around the face normal. ----
+  const KEY = v => `${v.x.toFixed(4)},${v.y.toFixed(4)},${v.z.toFixed(4)}`;
+  for (const f of faces) {
+    const vmap = new Map();
+    for (const t of f.tris) for (const v of t.vs) {
+      const k = KEY(v);
+      if (!vmap.has(k)) vmap.set(k, v.clone());
+    }
+    const verts = Array.from(vmap.values());
+    const center = new THREE.Vector3();
+    for (const v of verts) center.add(v);
+    center.multiplyScalar(1 / verts.length);
+    const u0 = new THREE.Vector3().subVectors(verts[0], center).normalize();
+    const w  = new THREE.Vector3().crossVectors(f.normal, u0);
+    const ang = v => {
+      const r = new THREE.Vector3().subVectors(v, center);
+      return Math.atan2(r.dot(w), r.dot(u0));
+    };
+    verts.sort((a, b) => ang(a) - ang(b));
+    f.verts = verts;
+    f.center = center;
+  }
+
+  // ---- 4) Build the three template geometries in a canonical local frame. ----
+  // Convention:
+  //   For CENTERS:  origin at face center, local +X = direction to face's vertex 0,
+  //                 local +Z = outward face normal, pentagon lies in local XY.
+  //   For CORNERS:  origin at face center, local +X = direction from C to outer
+  //                 vertex V, local +Z = outward face normal. Kite in local XY.
+  //   For EDGES:    origin at face center, local +X = direction from C to outer
+  //                 edge midpoint M, local +Z = outward face normal. Trapezoid in local XY.
+  //
+  // All 12 centers, 60 corners, and 60 edges are congruent within their group
+  // under the dodecahedron's symmetry — so one template per type is enough.
+
+  // Tunables — adjust these to retune the cut pattern across all 132 stickers.
+  const INNER_SCALE = 0.42;  // small pentagon radius as a fraction of the outer pentagon's circumradius
+  const CORNER_FRAC = 0.34;  // how far from each outer vertex V the corner cut emerges along the outer edges
+
+  // Pull face[0] geometry to derive template positions.
+  const f0 = faces[0];
+  const C0 = f0.center;
+  const V0_world = f0.verts[0];
+  const xAxis0 = new THREE.Vector3().subVectors(V0_world, C0).normalize();
+  const zAxis0 = f0.normal.clone();
+  const yAxis0 = new THREE.Vector3().crossVectors(zAxis0, xAxis0).normalize();
+  const toLocal = p => {
+    const r = new THREE.Vector3().subVectors(p, C0);
+    return [r.dot(xAxis0), r.dot(yAxis0), r.dot(zAxis0)];
+  };
+
+  // Outer pentagon circumradius R in the local face plane.
+  const R_outer = new THREE.Vector3().subVectors(V0_world, C0).length();
+
+  // -- CENTER template: small pentagon W_0..W_4 around origin, anchored so W_0 lies on +X.
+  const centerPts = [];
+  for (let i = 0; i < 5; i++) {
+    const ang = (2 * Math.PI / 5) * i;
+    centerPts.push([INNER_SCALE * R_outer * Math.cos(ang),
+                    INNER_SCALE * R_outer * Math.sin(ang)]);
+  }
+  // Fan-triangulate from vertex 0 — three CCW tris with front face toward +Z (outside).
+  centerGeom = new THREE.BufferGeometry();
+  const cPos = new Float32Array(15);
+  for (let i = 0; i < 5; i++) {
+    cPos[i * 3 + 0] = centerPts[i][0];
+    cPos[i * 3 + 1] = centerPts[i][1];
+    cPos[i * 3 + 2] = 0;
+  }
+  centerGeom.setAttribute('position', new THREE.BufferAttribute(cPos, 3));
+  centerGeom.setIndex([0, 1, 2,  0, 2, 3,  0, 3, 4]);
+  centerGeom.computeVertexNormals();
+  centerOutlineGeom   = makeOutlineGeom(centerPts, 0.022, 0.004);
+  centerHighlightGeom = makeHighlightGeom(centerPts, 0.08, 0.008);
+
+  // -- CORNER template: kite [W, A, V, B] at face[0] / outer vertex 0.
+  // W is the inner-pentagon vertex aligned with V (along +X).
+  // A is the cut endpoint along the outer edge toward V_{i-1} (in -Y half).
+  // B is the cut endpoint along the outer edge toward V_{i+1} (in +Y half).
+  // Vertex order traces CCW from +Z (verified analytically via shoelace).
+  {
+    const Vw   = f0.verts[0];
+    const Vprev = f0.verts[4]; // CCW order, so vertex 4 is "previous"
+    const Vnext = f0.verts[1];
+    const W = new THREE.Vector3().subVectors(Vw, C0).multiplyScalar(INNER_SCALE).add(C0);
+    const A = new THREE.Vector3().lerpVectors(Vw, Vprev, CORNER_FRAC);
+    const B = new THREE.Vector3().lerpVectors(Vw, Vnext, CORNER_FRAC);
+    const lW = toLocal(W), lA = toLocal(A), lV = toLocal(Vw), lB = toLocal(B);
+    const cornerPts = [[lW[0], lW[1]], [lA[0], lA[1]], [lV[0], lV[1]], [lB[0], lB[1]]];
+    cornerGeom = new THREE.BufferGeometry();
+    cornerGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+      lW[0], lW[1], 0,
+      lA[0], lA[1], 0,
+      lV[0], lV[1], 0,
+      lB[0], lB[1], 0,
+    ]), 3));
+    cornerGeom.setIndex([0, 1, 2,  0, 2, 3]);
+    cornerGeom.computeVertexNormals();
+    cornerOutlineGeom   = makeOutlineGeom(cornerPts, 0.022, 0.004);
+    cornerHighlightGeom = makeHighlightGeom(cornerPts, 0.08, 0.008);
+  }
+
+  // -- EDGE template: trapezoid [W_i, B_i, A_{i+1}, W_{i+1}] anchored at edge midpoint M_0.
+  // To match the placement convention (local +X = C→M), we build the template in
+  // a *rotated* local frame: rotate face[0]'s frame by +36° around +Z so that the
+  // direction C→M_0 (midpoint of V_0V_1) becomes the new +X.
+  {
+    const Vi   = f0.verts[0];
+    const Vi1  = f0.verts[1];
+    const Vim1 = f0.verts[4]; // not used here but kept for symmetry of derivation
+    const Wi   = new THREE.Vector3().subVectors(Vi,  C0).multiplyScalar(INNER_SCALE).add(C0);
+    const Wi1  = new THREE.Vector3().subVectors(Vi1, C0).multiplyScalar(INNER_SCALE).add(C0);
+    const Bi   = new THREE.Vector3().lerpVectors(Vi,  Vi1, CORNER_FRAC);   // close to V_i along V_iV_{i+1}
+    const Ai1  = new THREE.Vector3().lerpVectors(Vi1, Vi,  CORNER_FRAC);   // close to V_{i+1} along V_iV_{i+1}
+    // Re-anchor at the edge midpoint direction.
+    const Medge = new THREE.Vector3().addVectors(Vi, Vi1).multiplyScalar(0.5);
+    const xAxisE = new THREE.Vector3().subVectors(Medge, C0).normalize();
+    const yAxisE = new THREE.Vector3().crossVectors(zAxis0, xAxisE).normalize();
+    const toLocalE = p => {
+      const r = new THREE.Vector3().subVectors(p, C0);
+      return [r.dot(xAxisE), r.dot(yAxisE), r.dot(zAxis0)];
+    };
+    const lWi  = toLocalE(Wi);
+    const lBi  = toLocalE(Bi);
+    const lAi1 = toLocalE(Ai1);
+    const lWi1 = toLocalE(Wi1);
+    const edgePts = [[lWi[0], lWi[1]], [lBi[0], lBi[1]], [lAi1[0], lAi1[1]], [lWi1[0], lWi1[1]]];
+    edgeGeom = new THREE.BufferGeometry();
+    edgeGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+      lWi[0],  lWi[1],  0,
+      lBi[0],  lBi[1],  0,
+      lAi1[0], lAi1[1], 0,
+      lWi1[0], lWi1[1], 0,
+    ]), 3));
+    edgeGeom.setIndex([0, 1, 2,  0, 2, 3]);
+    edgeGeom.computeVertexNormals();
+    edgeOutlineGeom   = makeOutlineGeom(edgePts, 0.022, 0.004);
+    edgeHighlightGeom = makeHighlightGeom(edgePts, 0.08, 0.008);
+  }
+
+  // ---- 5) Instance placement.
+  // For each face f, place:
+  //   - 1 center sticker with basis [V_0-dir, n × V_0-dir, n]
+  //   - 5 corner stickers, slot i: basis pointing toward V_i
+  //   - 5 edge stickers,   slot i: basis pointing toward midpoint of (V_i, V_{i+1})
+
+  for (let fi = 0; fi < faces.length; fi++) {
+    const f = faces[fi];
+    const C = f.center;
+    const n = f.normal;
+
+    // --- center ---
+    {
+      const xA = new THREE.Vector3().subVectors(f.verts[0], C).normalize();
+      const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+      const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
+      const piece = new THREE.Mesh(centerGeom, centerBaseMat.clone());
+      piece.applyMatrix4(M);
+      piece.userData = {
+        type: 'center', face: fi, slot: 0,
+        index: pieces.length, groupKey: `C${fi}`,
+      };
+      const outline = new THREE.Mesh(centerOutlineGeom, outlineMat);
+      outline.renderOrder = 1;
+      piece.add(outline);
+      dod.add(piece);
+      pieces.push(piece);
+    }
+
+    // --- corners (5 per face) ---
+    for (let i = 0; i < 5; i++) {
+      const V = f.verts[i];
+      const xA = new THREE.Vector3().subVectors(V, C).normalize();
+      const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+      const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
+      const piece = new THREE.Mesh(cornerGeom, cornerBaseMat.clone());
+      piece.applyMatrix4(M);
+      piece.userData = {
+        type: 'corner', face: fi, slot: i,
+        index: pieces.length,
+        outerVertex: V.clone(),
+        groupKey: `V${KEY(V)}`,
+      };
+      const outline = new THREE.Mesh(cornerOutlineGeom, outlineMat);
+      outline.renderOrder = 1;
+      piece.add(outline);
+      dod.add(piece);
+      pieces.push(piece);
+    }
+
+    // --- edges (5 per face) ---
+    for (let i = 0; i < 5; i++) {
+      const Vi  = f.verts[i];
+      const Vi1 = f.verts[(i + 1) % 5];
+      const Mp  = new THREE.Vector3().addVectors(Vi, Vi1).multiplyScalar(0.5);
+      const xA  = new THREE.Vector3().subVectors(Mp, C).normalize();
+      const yA  = new THREE.Vector3().crossVectors(n, xA).normalize();
+      const M   = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
+      const piece = new THREE.Mesh(edgeGeom, edgeBaseMat.clone());
+      piece.applyMatrix4(M);
+      piece.userData = {
+        type: 'edge', face: fi, slot: i,
+        index: pieces.length,
+        edgeMid: Mp.clone(),
+        groupKey: `E${KEY(Mp)}`,
+      };
+      const outline = new THREE.Mesh(edgeOutlineGeom, outlineMat);
+      outline.renderOrder = 1;
+      piece.add(outline);
+      dod.add(piece);
+      pieces.push(piece);
+    }
+  }
+
+  // ---- 6) Group stickers into logical pieces by shared world-space key.
+  //   center groups: 1 sticker each (12 groups)
+  //   corner groups: 3 stickers each (20 groups), keyed by outer vertex world coords
+  //   edge groups:   2 stickers each (30 groups), keyed by edge midpoint world coords
+  const groupMap = new Map();
+  for (const p of pieces) {
+    const k = p.userData.groupKey;
+    if (!groupMap.has(k)) groupMap.set(k, []);
+    groupMap.get(k).push(p);
+  }
+  // Stable group indices per piece type so we can show "corner 3 / 20" etc.
+  const counters = { center: 0, edge: 0, corner: 0 };
+  for (const members of groupMap.values()) {
+    const type = members[0].userData.type;
+    const groupIndex = counters[type]++;
+    for (const m of members) {
+      m.userData.siblings = members;
+      m.userData.groupIndex = groupIndex;
+    }
+  }
+})();
+
+// ============================================================================
+//  SELECTION
+// ============================================================================
+let selectedPiece = null;        // array of sibling meshes for the selected piece
+const selInfoEl = document.getElementById('selected');
+
+const TYPE_LABEL = { center: 'Center', edge: 'Edge', corner: 'Corner' };
+const TYPE_TOTAL = { center: 12, edge: 30, corner: 20 };
+
+function updateInfo() {
+  if (!selectedPiece) { selInfoEl.textContent = 'No piece selected'; return; }
+  const first = selectedPiece[0];
+  const type = first.userData.type;
+  const groupIndex = first.userData.groupIndex;
+  const faces = selectedPiece.map(m => m.userData.face + 1).sort((a, b) => a - b);
+  selInfoEl.innerHTML =
+    `<b>Selected piece</b> <span class="pill ${type}">${TYPE_LABEL[type]}</span><br>` +
+    `<span class="dim">${TYPE_LABEL[type]}</span> ${groupIndex + 1} <span class="dim">/ ${TYPE_TOTAL[type]}</span><br>` +
+    `<span class="dim">Stickers</span> ${selectedPiece.length}<br>` +
+    `<span class="dim">${faces.length > 1 ? 'Touches faces' : 'On face'}</span> ${faces.join(', ')}`;
+}
+
+// One highlight geometry per piece-type — picked at selection time.
+const HL_GEOM = { center: null, edge: null, corner: null };
+// Filled in after build (the build IIFE already wrote the *Geom variables);
+// we capture them here for the selector.
+HL_GEOM.center = () => centerHighlightGeom;
+HL_GEOM.edge   = () => edgeHighlightGeom;
+HL_GEOM.corner = () => cornerHighlightGeom;
+
+function selectPiece(piece) {
+  if (selectedPiece) {
+    for (const m of selectedPiece) {
+      m.material.emissive.setHex(0x000000);
+      m.material.emissiveIntensity = 1;
+      if (m.userData.highlight) {
+        m.remove(m.userData.highlight);
+        m.userData.highlight = null;
+      }
+    }
+  }
+  selectedPiece = piece ? piece.userData.siblings : null;
+  if (selectedPiece) {
+    const hlGeom = HL_GEOM[selectedPiece[0].userData.type]();
+    for (const m of selectedPiece) {
+      m.material.emissive = new THREE.Color(0xffd166);
+      m.material.emissiveIntensity = 0.28;
+      const hl = new THREE.LineSegments(hlGeom, highlightMat);
+      hl.renderOrder = 2;
+      m.add(hl);
+      m.userData.highlight = hl;
+    }
+  }
+  updateInfo();
+}
+
+// ============================================================================
+//  INPUT — right-drag rotates; left-click (without drag) picks a piece
+// ============================================================================
+let rotating = false, px = 0, py = 0;
+let downX = 0, downY = 0, downBtn = -1;
+renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+renderer.domElement.addEventListener('mousedown', e => {
+  downX = e.clientX; downY = e.clientY; downBtn = e.button;
+  if (e.button === 2) { rotating = true; px = e.clientX; py = e.clientY; }
+});
+window.addEventListener('mousemove', e => {
+  if (!rotating) return;
+  dod.rotation.y += (e.clientX - px) * 0.006;
+  dod.rotation.x += (e.clientY - py) * 0.006;
+  px = e.clientX; py = e.clientY;
+});
+window.addEventListener('mouseup', e => {
+  if (e.button === 2) rotating = false;
+  if (e.button === 0 && downBtn === 0) {
+    const dx = e.clientX - downX, dy = e.clientY - downY;
+    if (Math.hypot(dx, dy) < 5) pickAt(e.clientX, e.clientY);
+  }
+  downBtn = -1;
+});
+
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+function pickAt(clientX, clientY) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.x =  ((clientX - rect.left) / rect.width)  * 2 - 1;
+  ndc.y = -((clientY - rect.top)  / rect.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObjects(pieces, false);
+  selectPiece(hits.length > 0 ? hits[0].object : null);
+}
+
+renderer.domElement.addEventListener('wheel', e => {
+  camera.position.z *= e.deltaY > 0 ? 1.08 : 1 / 1.08;
+  camera.position.z = Math.max(4, Math.min(30, camera.position.z));
+  e.preventDefault();
+}, { passive: false });
+
+(function loop() {
+  requestAnimationFrame(loop);
+  renderer.render(scene, camera);
+})();
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
