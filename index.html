@@ -57,6 +57,17 @@
     flex: 1; text-align: center;
     font-size: 15px; font-weight: 700; letter-spacing: 0.02em;
     color: #ffd166;
+    cursor: pointer; user-select: none;
+    padding: 2px 6px; border-radius: 6px;
+    transition: background 0.15s;
+  }
+  .nav .title:hover { background: rgba(255,209,102,0.10); }
+  .nav .title .variant {
+    display: block;
+    font-size: 10px; font-weight: 500; letter-spacing: 0.06em;
+    color: rgba(255,209,102,0.55);
+    margin-top: 1px;
+    text-transform: uppercase;
   }
   .nav button {
     background: rgba(255,255,255,0.06);
@@ -75,8 +86,10 @@
     width: 6px; height: 6px; border-radius: 50%;
     background: rgba(255,255,255,0.18);
     transition: background 0.2s;
+    cursor: pointer;
   }
   .nav .dot.active { background: #ffd166; }
+  .nav .dot.sep { width: 10px; background: transparent; cursor: default; }
 
   canvas { display: block; }
 </style>
@@ -181,6 +194,78 @@ function extractPolyhedralFaces(sourceGeom, faceTol = 0.01) {
   return faces;
 }
 const POLY_KEY = v => `${v.x.toFixed(4)},${v.y.toFixed(4)},${v.z.toFixed(4)}`;
+
+// Link pieces that lie on opposite sides of a shared polyhedron edge (or that
+// meet at a shared polyhedron vertex via two pairwise edge-shares) as
+// siblings — so selecting one selects all, and a value typed into one
+// propagates to the others. Pieces on the SAME face (matching faceReal) are
+// never merged: only cross-face shares count.
+//
+// For each piece we collect its world-space vertex keys, then key every pair
+// of those verts as a candidate shared edge. Two pieces sharing ≥1 such
+// edge-pair across different faces are unioned. This catches both two-way
+// edge twins (strips along a dihedral edge, edge cells across a face seam)
+// and three-way corner triples (the apex cell at a polyhedron vertex shares
+// a 2-vert edge with each of its two neighbour-face apex cells, chaining
+// all 3 into one group via union-find).
+function mergeSiblingsByPolyhedronEdge(pieces) {
+  if (!pieces || pieces.length === 0) return;
+  const tmp = new THREE.Vector3();
+  const vertKeysOf = pieces.map(p => {
+    p.updateMatrixWorld(true);
+    const pos = p.geometry.getAttribute('position');
+    const out = [];
+    const seen = new Set();
+    for (let i = 0; i < pos.count; i++) {
+      tmp.fromBufferAttribute(pos, i).applyMatrix4(p.matrixWorld);
+      const k = POLY_KEY(tmp);
+      if (!seen.has(k)) { seen.add(k); out.push(k); }
+    }
+    return out;
+  });
+  const edgeMap = new Map();
+  for (let i = 0; i < pieces.length; i++) {
+    const ks = vertKeysOf[i];
+    for (let a = 0; a < ks.length; a++) {
+      for (let b = a + 1; b < ks.length; b++) {
+        const ek = ks[a] < ks[b] ? ks[a] + '|' + ks[b] : ks[b] + '|' + ks[a];
+        if (!edgeMap.has(ek)) edgeMap.set(ek, []);
+        edgeMap.get(ek).push(i);
+      }
+    }
+  }
+  const parent = pieces.map((_, i) => i);
+  const find = x => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; };
+  for (const ids of edgeMap.values()) {
+    if (ids.length < 2) continue;
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const fa = pieces[ids[i]].userData.faceReal;
+        const fb = pieces[ids[j]].userData.faceReal;
+        if (fa !== undefined && fb !== undefined && fa === fb) continue;
+        union(ids[i], ids[j]);
+      }
+    }
+  }
+  const groups = new Map();
+  for (let i = 0; i < pieces.length; i++) {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(pieces[i]);
+  }
+  for (const members of groups.values()) {
+    if (members.length < 2) continue;
+    for (const p of members) p.userData.siblings = members;
+    // Propagate any value set during build (e.g. random givens) so all
+    // newly-linked siblings show the same digit.
+    let val = 0, given = false;
+    for (const m of members) {
+      if (m.userData.value) { val = m.userData.value; given = !!m.userData.isGiven; break; }
+    }
+    if (val) for (const m of members) setPieceDigit(m, val, given);
+  }
+}
 
 // Quad-strip outline around a closed polygon (2D points in face plane).
 function makeOutlineGeom(pts2d, halfW, lift) {
@@ -485,7 +570,12 @@ function handleDigitKey(e, ctx) {
 
 function refreshPanels() {
   if (!activeShape) return;
-  navTitleEl.textContent = activeShape.name;
+  const sameGroup = shapesInGroup(activeShape.group);
+  const pos = sameGroup.indexOf(activeShapeIndex);
+  const variantTxt = sameGroup.length > 1
+    ? `<span class="variant">${activeShape.group} · ${pos + 1} / ${sameGroup.length} · click to cycle</span>`
+    : '';
+  navTitleEl.innerHTML = `${activeShape.name}${variantTxt}`;
   infoBodyEl.innerHTML =
     `<span class="dim">${activeShape.subtitle}</span><br><br>${activeShape.controlsHTML}`;
   statsEl.innerHTML = activeShape.statsHTML();
@@ -496,9 +586,53 @@ function refreshSelected() {
   selectedEl.innerHTML = activeShape ? activeShape.selectedInfoHTML() : 'No selection';
 }
 function refreshDots() {
-  navDotsEl.innerHTML = SHAPES.map((s, i) =>
-    `<div class="dot${SHAPES[activeShapeIndex] === s ? ' active' : ''}"></div>`
-  ).join('');
+  const parts = [];
+  let prevGroup = null;
+  SHAPES.forEach((s, i) => {
+    if (prevGroup !== null && s.group !== prevGroup) {
+      parts.push('<div class="dot sep"></div>');
+    }
+    parts.push(
+      `<div class="dot${i === activeShapeIndex ? ' active' : ''}" data-idx="${i}" title="${s.name}"></div>`,
+    );
+    prevGroup = s.group;
+  });
+  navDotsEl.innerHTML = parts.join('');
+}
+
+function shapesInGroup(group) {
+  const out = [];
+  for (let i = 0; i < SHAPES.length; i++) {
+    if (SHAPES[i].group === group) out.push(i);
+  }
+  return out;
+}
+function cycleWithinGroup(dir = 1) {
+  const grp = activeShape && activeShape.group;
+  if (!grp) return;
+  const members = shapesInGroup(grp);
+  if (members.length < 2) return;
+  const pos = members.indexOf(activeShapeIndex);
+  const next = members[(pos + dir + members.length) % members.length];
+  switchToShape(next);
+}
+// Ordered list of unique groups, in registration order.
+function groupOrder() {
+  const seen = new Set(), order = [];
+  for (const s of SHAPES) {
+    if (!seen.has(s.group)) { seen.add(s.group); order.push(s.group); }
+  }
+  return order;
+}
+// Jump to the first shape of the next/prev group (wraps).
+function switchGroup(dir = 1) {
+  const order = groupOrder();
+  if (order.length === 0) return;
+  const curGroup = activeShape && activeShape.group;
+  const idx = order.indexOf(curGroup);
+  const next = order[((idx + dir) % order.length + order.length) % order.length];
+  const members = shapesInGroup(next);
+  if (members.length) switchToShape(members[0]);
 }
 
 function switchToShape(index) {
@@ -1550,7 +1684,7 @@ function makeKilominx45Shape() {
       '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
       '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
     cameraDistance: 9,
-    install() { build(); validatePolyhedralFaces(pieces); scene.add(group); },
+    install() { build(); mergeSiblingsByPolyhedronEdge(pieces); validatePolyhedralFaces(pieces); scene.add(group); },
     uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; selected = null; },
     get pickables() { return pieces; },
     pick(hit) {
@@ -1912,7 +2046,7 @@ function makeTuttminxShape() {
       '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
       '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
     cameraDistance: 10,
-    install() { build(); validatePolyhedralFaces(pieces); scene.add(group); },
+    install() { build(); mergeSiblingsByPolyhedronEdge(pieces); validatePolyhedralFaces(pieces); scene.add(group); },
     uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; selected = null; },
     get pickables() { return pieces; },
     pick(hit) {
@@ -1983,7 +2117,18 @@ function makeTuttminxShape() {
 //  Sudoku rule: each corner 3×3 is a 1–9 box; edge strips & centers
 //  carry decorative givens.
 // ============================================================================
-function makeTeraminxShape() {
+function makeTeraminxShape(opts = {}) {
+  const {
+    name = 'Sudoku Teraminx',
+    subtitle = '12 dodecahedral faces × 61 pieces (1 center + 5 edge stacks × 3 strips + 5 corners × 3×3). Each corner is one Sudoku box.',
+    centerRadius = 0.42,
+    alpha = 0.36,
+    // When true, the central pentagon and the innermost edge strip of every
+    // stack are rendered as dark "blocked" pieces — non-pickable, no digits,
+    // not validated. Used by Elite Kilominx to hide the centers.
+    blockInner = false,
+  } = opts;
+
   let group = null;
   let pieces = [];
   let selected = null;
@@ -1998,9 +2143,9 @@ function makeTeraminxShape() {
   // CENTER_RADIUS > 1−2·ALPHA the inner edge is LONGER than the outer edge,
   // so the slanted sides converge OUTWARD (toward the face perimeter) and
   // each strip's tangential width shrinks moving outward.
-  const CENTER_RADIUS = 0.42;
+  const CENTER_RADIUS = centerRadius;
   // ALPHA = fraction of each face edge the corner-diamond claims at each end.
-  const ALPHA = 0.36;
+  const ALPHA = alpha;
   // Subdivision counts.
   const EDGE_STRIPS = 3;   // each edge trapezoid → 3 radial strips
   const CORNER_N    = 3;   // each corner diamond → 3×3 grid (9 cells)
@@ -2087,6 +2232,9 @@ function makeTeraminxShape() {
     const centerMat = new THREE.MeshStandardMaterial({
       color: 0xc89d4a, roughness: 0.5, metalness: 0.08, flatShading: true,
     });
+    const blockedMat = new THREE.MeshStandardMaterial({
+      color: 0x141414, roughness: 0.95, metalness: 0.0, flatShading: true,
+    });
 
     let faceIdx = 0;
     for (const f of faces) {
@@ -2110,13 +2258,13 @@ function makeTeraminxShape() {
         cg.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
         cg.setIndex([0, 1, 2, 0, 2, 3, 0, 3, 4]);
         cg.computeVertexNormals();
-        const centerPiece = new THREE.Mesh(cg, centerMat.clone());
+        const centerPiece = new THREE.Mesh(cg, (blockInner ? blockedMat : centerMat).clone());
         centerPiece.applyMatrix4(Mc);
         const pts2dC = localPts.map(p => [p.x, p.y]);
         const ctr2dC = centroidOf2D(pts2dC);
         const sizeC  = fitDigitSize(pts2dC, 0.55);
         centerPiece.userData = {
-          type: 'center',
+          type: blockInner ? 'blocked' : 'center',
           face: faceIdx * 1000,
           faceReal: faceIdx,
           digitLocal: { x: ctr2dC[0], y: ctr2dC[1], size: sizeC },
@@ -2127,7 +2275,7 @@ function makeTeraminxShape() {
         cOutline.renderOrder = 1;
         centerPiece.add(cOutline);
         group.add(centerPiece);
-        pieces.push(centerPiece);
+        if (!blockInner) pieces.push(centerPiece);
       }
 
       // Megaminx-base annular geometry: inner pentagon + outer (face) vertices
@@ -2160,12 +2308,13 @@ function makeTeraminxShape() {
           const P1 = lerpV3(innerLeft,  outerLeft,  t1);
           const P2 = lerpV3(innerRight, outerRight, t1);
           const P3 = lerpV3(innerRight, outerRight, t0);
+          const isBlocked = blockInner;
           const strip = makeQuadPiece(
             P0, P1, P2, P3,
             n,
-            edgeMats[s],
+            isBlocked ? blockedMat : edgeMats[s],
             {
-              type: 'trapezoid',
+              type: isBlocked ? 'blocked' : 'trapezoid',
               face: faceIdx * 1000 + 100 + i * 10 + s,
               faceReal: faceIdx,
               edgeIdx: i,
@@ -2173,7 +2322,7 @@ function makeTeraminxShape() {
             },
           );
           group.add(strip);
-          pieces.push(strip);
+          if (!isBlocked) pieces.push(strip);
         }
       }
 
@@ -2258,13 +2407,13 @@ function makeTeraminxShape() {
   }
 
   const api = {
-    name: 'Sudoku Teraminx',
-    subtitle: '12 dodecahedral faces × 61 pieces (1 center + 5 edge stacks × 3 strips + 5 corners × 3×3). Each corner is one Sudoku box.',
+    name,
+    subtitle,
     controlsHTML:
       '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
       '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
     cameraDistance: 9,
-    install() { build(); validatePolyhedralFaces(pieces); scene.add(group); },
+    install() { build(); mergeSiblingsByPolyhedronEdge(pieces); validatePolyhedralFaces(pieces); scene.add(group); },
     uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; selected = null; },
     get pickables() { return pieces; },
     pick(hit) {
@@ -2316,8 +2465,11 @@ function makeTeraminxShape() {
              `<span class="dim">Piece value</span> ${v}`;
     },
     statsHTML() {
+      const total = blockInner
+        ? '<span class="dim">pieces/face</span> <span class="stat-num">55</span> <span class="dim">(5×2 + 5×9, center + inner ring blocked)</span><br>'
+        : '<span class="dim">pieces/face</span> <span class="stat-num">61</span> <span class="dim">(1 + 5×3 + 5×9)</span><br>';
       return `<span class="dim">faces</span> <span class="stat-num">12</span> <span class="dim">pentagons</span><br>` +
-             `<span class="dim">pieces/face</span> <span class="stat-num">61</span> <span class="dim">(1 + 5×3 + 5×9)</span><br>` +
+             total +
              `<span class="dim">total pieces</span> <span class="stat-num">${pieces.length}</span><br>` +
              `<span class="dim">given clues</span> <span class="stat-num">${givenCount}</span><br>` +
              `<span class="dim">your entries</span> <span class="stat-num">${userEntries}</span>`;
@@ -2329,32 +2481,47 @@ function makeTeraminxShape() {
 // ============================================================================
 //  REGISTER ALL SHAPES
 // ============================================================================
-SHAPES.push(makeCubeShape(4));
-SHAPES.push(makeCubeShape(9));
+function registerShape(shape, group) {
+  shape.group = group || shape.name;
+  SHAPES.push(shape);
+}
 
-// SHAPES.push(makeKilominxShape()); // hidden
+registerShape(makeCubeShape(4), 'Sudoku Cube');
+registerShape(makeCubeShape(9), 'Sudoku Cube');
 
-SHAPES.push(makeKilominx45Shape());
-SHAPES.push(makeTuttminxShape());
-SHAPES.push(makeTeraminxShape());
+// registerShape(makeKilominxShape(), 'Sudoku Kilominx'); // hidden
 
-SHAPES.push(makeMinxLikeShape({
+registerShape(makeKilominx45Shape(), 'Sudoku Tuttminx');
+registerShape(makeTuttminxShape(), 'Sudoku Tuttminx');
+registerShape(makeTeraminxShape(), 'Sudoku Megaminx');
+registerShape(makeTeraminxShape({
+  name: 'Sudoku Elite Kilominx',
+  subtitle: '12 dodecahedral faces. Same layout as the Teraminx but the central pentagon AND all three edge strips of every stack are shrunk down and blocked off — only the 5 corner sudoku boxes per face (45 cells) are playable.',
+  // Very small inner pentagon → the entire blocked center column (pentagon
+  // + all three edge strips of every stack) is tiny, leaving the corner
+  // diamonds to dominate the face.
+  centerRadius: 0.12,
+  alpha: 0.42,
+  blockInner: true,
+}), 'Sudoku Kilominx');
+
+registerShape(makeMinxLikeShape({
   name: 'Sudoku Megaminx',
   subtitle: '132 stickers across 62 pieces on a dodecahedron.',
   sourceGeomFactory: () => new THREE.DodecahedronGeometry(2.5),
   totals: { center: 12, edge: 30, corner: 20 },
   statLines: [['centers', 12], ['edges', 30], ['corners', 20], ['stickers', 132]],
   colors: { center: 0xd4a766, edge: 0x6a7fc8, corner: 0x9f76e0 },
-}));
+}), 'Sudoku Megaminx');
 
-SHAPES.push(makeMinxLikeShape({
+registerShape(makeMinxLikeShape({
   name: 'Sudoku Icosaminx',
   subtitle: '140 stickers across 62 pieces on an icosahedron.',
   sourceGeomFactory: () => new THREE.IcosahedronGeometry(2.5, 0),
   totals: { center: 20, edge: 30, corner: 12 },
   statLines: [['centers', 20], ['edges', 30], ['corners', 12], ['stickers', 140]],
   colors: { center: 0x66c8a7, edge: 0x6a7fc8, corner: 0xe0769e },
-}));
+}), 'Sudoku Icosaminx');
 
 // ============================================================================
 //  INPUT — shared across all shapes
@@ -2411,13 +2578,20 @@ renderer.domElement.addEventListener('wheel', e => {
 
 window.addEventListener('keydown', e => {
   // Shape navigation — only when active shape doesn't consume the key.
-  if (e.key === '[') { switchToShape(activeShapeIndex - 1); e.preventDefault(); return; }
-  if (e.key === ']') { switchToShape(activeShapeIndex + 1); e.preventDefault(); return; }
+  if (e.key === '[') { switchGroup(-1); e.preventDefault(); return; }
+  if (e.key === ']') { switchGroup( 1); e.preventDefault(); return; }
   if (activeShape && activeShape.keydown) activeShape.keydown(e);
 });
 
-document.getElementById('navPrev').addEventListener('click', () => switchToShape(activeShapeIndex - 1));
-document.getElementById('navNext').addEventListener('click', () => switchToShape(activeShapeIndex + 1));
+document.getElementById('navPrev').addEventListener('click', () => switchGroup(-1));
+document.getElementById('navNext').addEventListener('click', () => switchGroup( 1));
+navTitleEl.addEventListener('click', () => cycleWithinGroup(1));
+navDotsEl.addEventListener('click', e => {
+  const d = e.target.closest('.dot');
+  if (!d || d.classList.contains('sep')) return;
+  const idx = parseInt(d.dataset.idx, 10);
+  if (!Number.isNaN(idx)) switchToShape(idx);
+});
 
 // ============================================================================
 //  RENDER LOOP

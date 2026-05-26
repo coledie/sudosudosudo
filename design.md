@@ -1,6 +1,6 @@
 # Sudoku Polyhedra — Design Document
 
-A working log + design reference for putting **Sudoku-style cell layouts onto polyhedral twisty-puzzle cut patterns** in Three.js. The repo contains four shapes — Cube, Kilominx, Megaminx, Icosaminx — built progressively from a single design pattern, then merged into one unified webpage (`index.html`).
+A working log + design reference for putting **Sudoku-style cell layouts onto polyhedral twisty-puzzle cut patterns** in Three.js. The repo contains eight shapes across five families — Cube, Tuttminx-family (Megaminx 46, Tuttminx), Megaminx-family (Teraminx, Megaminx), Kilominx (Elite Kilominx), Icosaminx — built progressively from a single design pattern and unified in `index.html`.
 
 This doc captures the pattern, what we tried, what failed, and what the geometry actually is. It is written so that the next shape (Pyraminx, Skewb, Crystal, ...) can be added without re-deriving the recipe.
 
@@ -199,6 +199,46 @@ The dual-polyhedron flip: face-turning icosahedron at Megaminx-equivalent cut de
 
 This shape was the cleanest demonstration of the universal pattern: most of the Megaminx code ported unchanged, with the changes being exactly the four things the recipe identifies as shape-specific (source primitive, per-face vertex count, center template shape, grouping totals).
 
+### II.5 — Megaminx 46 (per-wedge sudoku)
+
+Same dodecahedron face layout as the Megaminx, but instead of 11 stickers per face the annulus is cut into **5 wedges × 9 quads** + 1 center = 46 pieces per face. Each wedge spans `[V_i, V_{i+1}]` and is divided into a 3×3 sudoku box. Per-wedge sudoku constraint is enforced via `validatePolyhedralFaces` keyed on `face: faceIdx*5 + wi`.
+
+This is the first shape where a single Sudoku box (the wedge's 3×3) lives entirely on one face, but neighbouring faces' wedges across a shared dihedral edge still link their boundary cells as **siblings** (see III.7).
+
+### II.6 — Tuttminx (32 faces — 12 pentagons + 20 hexagons)
+
+Source primitive: a custom truncated-icosahedron geometry. The pentagon faces use the same Megaminx-style 5-wedge × 9-cell layout; the hexagon faces use 6 wedges × 9 cells = 55 pieces per hex face. Total pieces vary by face mix.
+
+Reuses the `makeMinxLikeShape`-style wedge code, parameterised on per-face vertex count. The truncated-icosahedron polyhedron is the first non-regular shape in the repo — face types are *not* all congruent, so the per-face-vertex-count branch in Step 3 of the recipe finally matters.
+
+### II.7 — Teraminx (12 dodecahedral faces, 61 pieces per face)
+
+The deepest-cut polyhedron in the repo. Each face has:
+
+- **1 center pentagon** — vertices `I[i] = lerp(C, V[i], CENTER_RADIUS)` with `CENTER_RADIUS = 0.42`.
+- **5 edge stacks**, each a trapezoid split into 3 radial strips. The trapezoid is **outward-tapering**: its inner edge (along the inner pentagon, length `CENTER_RADIUS · L`) is longer than its outer edge (the middle `1 − 2·ALPHA` of one face edge, `ALPHA = 0.36`, so length `0.28·L`). The three strips have *equal radial height* (`EDGE_CUTS = [0, 1/3, 2/3, 1]`); the tangential taper comes entirely from the trapezoid's converging sides.
+- **5 corner diamonds**, each `[I_i, X_{i-1}, O_i, Y_i]` (with `Y_i = lerp(V_i, V_{i+1}, ALPHA)`, `X_i = lerp(V_i, V_{i+1}, 1-ALPHA)`), subdivided into a 3×3 grid forming a sudoku box that *naturally tapers* toward the polyhedron vertex `O_i`.
+
+Total: 1 + 5·3 + 5·9 = 61 cells × 12 faces = **732 cells**.
+
+**The five constants and what they do**, summarised because tuning these is the only thing that changes between Teraminx and Elite Kilominx:
+
+| Constant | Role | Teraminx | Elite Kilominx |
+|---|---|---:|---:|
+| `CENTER_RADIUS` | Inner-pentagon radius as fraction of face vertex | 0.42 | 0.12 |
+| `ALPHA` | Fraction of each face edge claimed by the corner diamond at each end | 0.36 | 0.42 |
+| `EDGE_STRIPS` | Radial sub-strip count per edge stack | 3 | 3 |
+| `CORNER_N` | Sudoku-box subdivision per corner | 3 | 3 |
+| `blockInner` | Render center pentagon + all 3 edge strips as dark non-pickable "blocked" pieces | `false` | `true` |
+
+**Outward-taper invariant**: for the trapezoid's sides to converge *toward the face perimeter* (so strips are wider at the centre, narrower at the outside), `CENTER_RADIUS > 1 − 2·ALPHA` must hold. Teraminx satisfies this with 0.42 > 0.28; Elite Kilominx with 0.12 > 0.16... no, here it fails — but that doesn't matter because Elite Kilominx blocks all edge strips, so taper direction is invisible.
+
+### II.8 — Elite Kilominx (Teraminx with the entire centre column blocked)
+
+Same factory as Teraminx (`makeTeraminxShape({ blockInner: true })`), but the centre pentagon **and all three edge strips of every stack** render as dark `0x141414` non-pickable "blocked" pieces — not pushed into the `pieces` array, no digit, not validated. Only the 5 corner sudoku boxes per face remain playable: **5 × 9 × 12 = 540 cells**, distributed as 60 sudoku boxes (5 corner boxes/face × 12 faces).
+
+The blocked column is shrunk dramatically by setting `centerRadius = 0.12`, which pulls the corner diamonds' inner vertex `I[i]` close to the face centre and lets the 5 corner boxes dominate the visible face area.
+
 ---
 
 ## Part III — Hard-won meta-lessons
@@ -235,6 +275,57 @@ If a `INSET > 0` shrinks each sticker toward its centroid, the gaps between adja
 
 - **Solid look** (what we use everywhere): `INSET = 0`, stickers tile flush, dark seams come from the outline-stripe overlay
 - **Puzzle-piece look** (sketched in the Kilominx doc, not currently used): keep `INSET > 0` and extrude each sticker into a 3D prism so the seams become solid side-walls
+
+### 7. Sibling grouping by world-vertex pairs unifies edges *and* 3-way corners
+
+For Megaminx-class shapes the original recipe (Step 5) hashed edge pieces by midpoint key (`E{mid}`, 2 siblings) and corner pieces by vertex key (`V{vert}`, 3 siblings) — two different keys for two different topologies.
+
+When the Teraminx / Megaminx 46 / Tuttminx factories arrived, their wedge / strip / corner-box cells have **finer subdivisions**, and the cells that *happen to lie along a shared polyhedron edge or vertex* aren't all at the same midpoint or vertex — they're at fractional positions along the dihedral.
+
+The unifying observation: every sibling-pair shares **at least one pair of world-space vertices** (i.e. a shared edge segment in 3-space). A 3-way corner triple A–B–C still chains via two pairwise edge-shares (A↔B across one dihedral, B↔C across another) so union-find sweeps it into one group.
+
+The helper `mergeSiblingsByPolyhedronEdge(pieces)` implements this generically:
+
+1. For each piece, read its world-space vertices via `bufferAttr ∘ piece.matrixWorld` and round through `POLY_KEY` (4 decimal places).
+2. For each unordered pair of those vertex keys, register the pair → piece in a map.
+3. Pairs with ≥2 pieces sharing them indicate a shared edge in 3-space. Union-find merges those pieces, but **only across different `faceReal`** (same-face neighbours share interior edges that must not be merged).
+4. After grouping, propagate any random-given digit set during `build()` to all newly-linked siblings via `setPieceDigit`.
+
+This single helper subsumed the per-piece-type hashing scheme for the three deepest-cut shapes, and is the only mechanism that correctly handles 3-way vertex-sharing for the apex cells of corner sudoku boxes (which share exactly one polyhedron vertex but pairwise share full edges through it).
+
+### 8. Block tiles by *not pushing them into `pieces`*
+
+The Elite Kilominx needed to disable interaction on the center pentagon and three edge strips of every stack. The cleanest implementation is **the opposite of feature-gating in the renderer**:
+
+- Still construct the mesh and add it to the THREE group (so the polyhedron is visually filled).
+- Use a dark `0x141414` flat material that visually reads as a non-playable region.
+- **Do not push the piece into the `pieces` array.** That array is the picking source, the `validatePolyhedralFaces` input, and the `mergeSiblingsByPolyhedronEdge` input — skipping it disables selection, sudoku constraints, sibling linking, and digit rendering in one go.
+
+This let the Teraminx and Elite Kilominx share **the same factory function with one `blockInner` flag**, and the diff between them is purely numerical (5 constants in a table) instead of structural.
+
+### 9. Shape grouping for UI navigation
+
+With eight shapes registered, linear-only ◀/▶ stepping made the puzzle picker tedious — variants of the same family (Cube 4 vs Cube 9; Teraminx vs Megaminx) are usually compared to each other, so the natural unit of navigation is "family". The UI distinguishes three navigation operations:
+
+| Action | Effect |
+|---|---|
+| ◀ / ▶ buttons, `[` / `]` keys | Jump to the **first shape of the previous/next group** (`switchGroup(dir)`) |
+| Click the title | Cycle **within the current group** (`cycleWithinGroup(1)`) |
+| Click a dot | Jump directly to that specific shape (`switchToShape(idx)`) |
+
+Groups are assigned at registration time via a `registerShape(shape, group)` wrapper that writes `shape.group = group`. The current grouping:
+
+```
+Sudoku Cube     :  Cube 4×4,  Cube 9×9
+Sudoku Tuttminx :  Megaminx 46,  Tuttminx
+Sudoku Megaminx :  Teraminx,  Megaminx
+Sudoku Kilominx :  Elite Kilominx
+Sudoku Icosaminx:  Icosaminx
+```
+
+The dots strip renders one dot per shape with a transparent `.dot.sep` between groups, giving a visual hint of the family boundaries. The title displays a small caption `Group · N / M · click to cycle` only when the group has more than one variant.
+
+Naming convention worth noting: a "group" is identified by a *display label* string (the family name shown under the title), which is independent of any single shape's `name`. Two shapes are siblings in the picker if and only if their `group` strings match exactly. Registration order within a group determines cycle direction.
 
 ### 7. Backface culling is free shape-closure
 
