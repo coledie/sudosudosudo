@@ -377,6 +377,54 @@ function validatePolyhedralFaces(pieces) {
   }
 }
 
+// Each quad piece carries userData.row, userData.col (both 0..8) defining
+// its position inside a 9×9 sudoku grid local to its wedge. Validation:
+// rows, columns, and 3×3 sub-blocks within each wedge must each have
+// unique non-zero digits.
+function validateWedge9x9Sudoku(pieces) {
+  const byWedge = new Map();
+  for (const p of pieces) {
+    if (p.userData.type !== 'quad') continue;
+    const w = p.userData.face;
+    if (!byWedge.has(w)) byWedge.set(w, []);
+    byWedge.get(w).push(p);
+  }
+  const conflicts = new Set();
+  for (const list of byWedge.values()) {
+    const grid = Array.from({ length: 9 }, () => Array(9).fill(null));
+    for (const p of list) grid[p.userData.row][p.userData.col] = p;
+    const flag = (group) => {
+      const seen = new Map();
+      for (const p of group) {
+        if (!p) continue;
+        const v = p.userData.value;
+        if (!v) continue;
+        if (!seen.has(v)) seen.set(v, []);
+        seen.get(v).push(p);
+      }
+      for (const dups of seen.values()) {
+        if (dups.length > 1) for (const p of dups) conflicts.add(p);
+      }
+    };
+    for (let r = 0; r < 9; r++) flag(grid[r]);
+    for (let c = 0; c < 9; c++) flag(grid.map(row => row[c]));
+    for (let br = 0; br < 3; br++) for (let bc = 0; bc < 3; bc++) {
+      const blk = [];
+      for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+        blk.push(grid[br * 3 + dr][bc * 3 + dc]);
+      }
+      flag(blk);
+    }
+  }
+  for (const p of pieces) {
+    if (p.userData.type !== 'quad') continue;
+    const shouldFlag = !p.userData.isGiven && p.userData.value !== 0 && conflicts.has(p);
+    if (!!p.userData.isConflict !== shouldFlag) {
+      setPieceDigit(p, p.userData.value, p.userData.isGiven, shouldFlag);
+    }
+  }
+}
+
 // Per-frame: rotate every piece's digit plane so its +Y aligns with the
 // camera's up vector, projected into the piece's local face plane (XY).
 const _camUpWorld = new THREE.Vector3();
@@ -1050,8 +1098,9 @@ function makeMinxLikeShape(opts) {
     givenCount = 0;
     userEntries = 0;
 
+    let faces;
     const sourceGeom = opts.sourceGeomFactory();
-    const faces = extractPolyhedralFaces(sourceGeom);
+    faces = extractPolyhedralFaces(sourceGeom);
     sourceGeom.dispose();
 
     const N_VERTS = faces[0].verts.length; // 3 (icos triangle) or 5 (dodec pentagon)
@@ -1302,12 +1351,992 @@ function makeMinxLikeShape(opts) {
 }
 
 // ============================================================================
+//  SUDOKU KILOMINX 45 — dodecahedron, each pentagonal face split into 5 wedges,
+//  each wedge subdivided into 9 small triangles (frequency-3). 45 pieces/face,
+//  540 pieces total. Constraint: per-wedge sudoku (digits 1–9 once per wedge).
+// ============================================================================
+function makeKilominx45Shape() {
+  let group = null;
+  let pieces = [];
+  let selected = null;
+  let selectedSticker = null;
+  let givenCount = 0, userEntries = 0;
+
+  // 3×3 radial-angular subdivision of the isoceles wedge (C, A, B) → 9 quadrilaterals.
+  // Radial s: 0 = apex C, 1 = base AB. Angular t: 0 = toward A, 1 = toward B.
+  // s_inner > 0 keeps the apex row from collapsing to triangles.
+  const S_INNER = 0.32; // inner pentagonal center piece occupies s in [0, S_INNER]
+  function buildWedgeQuads(C, A, B) {
+    const sLevels = [S_INNER, S_INNER + (1 - S_INNER) / 3, S_INNER + 2 * (1 - S_INNER) / 3, 1];
+    const tLevels = [0, 1/3, 2/3, 1];
+    const _CA = new THREE.Vector3().subVectors(A, C);
+    const _CB = new THREE.Vector3().subVectors(B, C);
+    const P = (s, t) => new THREE.Vector3()
+      .copy(C)
+      .addScaledVector(_CA, s * (1 - t))
+      .addScaledVector(_CB, s * t);
+    const quads = [];
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++) {
+        const s0 = sLevels[i], s1 = sLevels[i+1];
+        const t0 = tLevels[j], t1 = tLevels[j+1];
+        // CCW (viewed from outside / +normal side)
+        quads.push([P(s0, t0), P(s1, t0), P(s1, t1), P(s0, t1)]);
+      }
+    return quads;
+  }
+
+  function build() {
+    group = new THREE.Group();
+    pieces = [];
+    selected = null;
+    selectedSticker = null;
+    givenCount = 0;
+    userEntries = 0;
+
+    const sourceGeom = new THREE.DodecahedronGeometry(2.5);
+    const faces = extractPolyhedralFaces(sourceGeom);
+    sourceGeom.dispose();
+
+    const baseMat = new THREE.MeshStandardMaterial({
+      color: 0x6a7fc8, roughness: 0.5, metalness: 0.08, flatShading: true,
+    });
+
+    let faceIdx = 0;
+    for (const f of faces) {
+      const C = f.center, n = f.normal;
+
+      // --- Megaminx-style center pentagon piece ---------------------------
+      {
+        const cVerts = [];
+        for (let vi = 0; vi < 5; vi++) {
+          cVerts.push(new THREE.Vector3()
+            .copy(C)
+            .addScaledVector(new THREE.Vector3().subVectors(f.verts[vi], C), S_INNER));
+        }
+        const cCtr = C.clone();
+        const xA = new THREE.Vector3().subVectors(cVerts[0], cCtr).normalize();
+        const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+        const Mc = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(cCtr);
+        const Mci = new THREE.Matrix4().copy(Mc).invert();
+        const localPts = cVerts.map(v => v.clone().applyMatrix4(Mci));
+        const posArr = new Float32Array(15);
+        for (let i = 0; i < 5; i++) {
+          posArr[i*3+0] = localPts[i].x;
+          posArr[i*3+1] = localPts[i].y;
+          posArr[i*3+2] = localPts[i].z;
+        }
+        const cg = new THREE.BufferGeometry();
+        cg.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+        cg.setIndex([0, 1, 2, 0, 2, 3, 0, 3, 4]);
+        cg.computeVertexNormals();
+        const centerMat = baseMat.clone();
+        centerMat.color.setHex(0x9d6cc8);
+        const centerPiece = new THREE.Mesh(cg, centerMat);
+        centerPiece.applyMatrix4(Mc);
+        const pts2dC = localPts.map(p => [p.x, p.y]);
+        const ctr2dC = centroidOf2D(pts2dC);
+        const sizeC  = fitDigitSize(pts2dC, 0.55);
+        centerPiece.userData = {
+          type: 'center',
+          face: 100000 + faceIdx, // unique per face — no sudoku constraint links
+          faceReal: faceIdx,
+          wedge: -1,
+          slot: -1,
+          digitLocal: { x: ctr2dC[0], y: ctr2dC[1], size: sizeC },
+          value: 0, isGiven: false, digit: null,
+        };
+        centerPiece.userData.siblings = [centerPiece];
+        const cOutline = new THREE.Mesh(makeOutlineGeom(pts2dC, 0.012, 0.003), POLY_OUTLINE_MAT);
+        cOutline.renderOrder = 1;
+        centerPiece.add(cOutline);
+        group.add(centerPiece);
+        pieces.push(centerPiece);
+      }
+
+      for (let wi = 0; wi < 5; wi++) {
+        const A = f.verts[wi];
+        const B = f.verts[(wi + 1) % 5];
+        const wedgeQuads = buildWedgeQuads(C, A, B);
+        // Use a combined wedge ID for per-wedge validation via validatePolyhedralFaces.
+        const wedgeId = faceIdx * 5 + wi;
+        for (let ti = 0; ti < wedgeQuads.length; ti++) {
+          const [P0, P1, P2, P3] = wedgeQuads[ti];
+          const ctr = new THREE.Vector3().add(P0).add(P1).add(P2).add(P3).multiplyScalar(1 / 4);
+          const xA = new THREE.Vector3().subVectors(P0, ctr).normalize();
+          const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+          const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(ctr);
+          const Mi = new THREE.Matrix4().copy(M).invert();
+          const p0L = P0.clone().applyMatrix4(Mi);
+          const p1L = P1.clone().applyMatrix4(Mi);
+          const p2L = P2.clone().applyMatrix4(Mi);
+          const p3L = P3.clone().applyMatrix4(Mi);
+          const g = new THREE.BufferGeometry();
+          g.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+            p0L.x, p0L.y, p0L.z,
+            p1L.x, p1L.y, p1L.z,
+            p2L.x, p2L.y, p2L.z,
+            p3L.x, p3L.y, p3L.z,
+          ]), 3));
+          g.setIndex([0, 1, 2, 0, 2, 3]);
+          g.computeVertexNormals();
+          const piece = new THREE.Mesh(g, baseMat.clone());
+          piece.applyMatrix4(M);
+          const pts2d = [[p0L.x, p0L.y], [p1L.x, p1L.y], [p2L.x, p2L.y], [p3L.x, p3L.y]];
+          const ctr2d = centroidOf2D(pts2d);
+          const size  = fitDigitSize(pts2d, 0.70);
+          piece.userData = {
+            type: 'quad',
+            face: wedgeId,     // per-wedge validation
+            faceReal: faceIdx, // for UI display
+            wedge: wi,
+            slot: ti,
+            digitLocal: { x: ctr2d[0], y: ctr2d[1], size },
+            value: 0, isGiven: false, digit: null,
+          };
+          piece.userData.siblings = [piece];
+          const outline = new THREE.Mesh(makeOutlineGeom(pts2d, 0.012, 0.003), POLY_OUTLINE_MAT);
+          outline.renderOrder = 1;
+          piece.add(outline);
+          group.add(piece);
+          pieces.push(piece);
+        }
+      }
+      faceIdx++;
+    }
+
+    // Random initial givens — per wedge, choose up to 3 distinct (slot, value)
+    // pairs so we don't immediately conflict the wedge's per-9 rule.
+    // Center pieces are validated independently (no cross-piece constraint).
+    const byWedge = new Map();
+    for (const p of pieces) {
+      if (p.userData.type === 'center') continue;
+      const w = p.userData.face;
+      if (!byWedge.has(w)) byWedge.set(w, []);
+      byWedge.get(w).push(p);
+    }
+    // Optional given for center pieces (~40% chance each).
+    for (const p of pieces) {
+      if (p.userData.type !== 'center') continue;
+      if (Math.random() < 0.4) {
+        const v = 1 + Math.floor(Math.random() * 9);
+        setPieceDigit(p, v, true);
+        givenCount++;
+      }
+    }
+    for (const wedgeArr of byWedge.values()) {
+      const slots = [...wedgeArr];
+      // Shuffle
+      for (let i = slots.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [slots[i], slots[j]] = [slots[j], slots[i]];
+      }
+      const givenCountPerWedge = 2 + Math.floor(Math.random() * 3); // 2..4 givens
+      const usedValues = new Set();
+      for (let k = 0; k < givenCountPerWedge; k++) {
+        let v;
+        do { v = 1 + Math.floor(Math.random() * 9); } while (usedValues.has(v));
+        usedValues.add(v);
+        setPieceDigit(slots[k], v, true);
+        givenCount++;
+      }
+    }
+  }
+
+  const api = {
+    name: 'Sudoku Megaminx 46',
+    subtitle: '12 dodecahedral faces × 46 pieces (1 center + 5 wedges × 9 quads). Per-wedge sudoku, free centers.',
+    controlsHTML:
+      '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
+      '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
+    cameraDistance: 9,
+    install() { build(); validatePolyhedralFaces(pieces); scene.add(group); },
+    uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; selected = null; },
+    get pickables() { return pieces; },
+    pick(hit) {
+      if (selected) for (const m of selected) {
+        m.material.emissive.setHex(0x000000); m.material.emissiveIntensity = 1;
+      }
+      selectedSticker = hit ? hit.object : null;
+      selected = hit ? hit.object.userData.siblings : null;
+      if (selected) for (const m of selected) {
+        m.material.emissive = new THREE.Color(0xffd166);
+        m.material.emissiveIntensity = 0.30;
+      }
+      refreshSelected();
+    },
+    clearPick() { this.pick(null); },
+    keydown(e) {
+      return handleDigitKey(e, {
+        getTarget: () => selectedSticker,
+        onChange: (piece, value) => {
+          const prev = piece.userData.value;
+          setPieceDigit(piece, value, false);
+          if (prev === 0 && value !== 0) userEntries++;
+          else if (prev !== 0 && value === 0) userEntries--;
+          validatePolyhedralFaces(pieces);
+          refreshSelected();
+          statsEl.innerHTML = api.statsHTML();
+        },
+      });
+    },
+    frame() { updatePolyhedralDigits(pieces, group, camera); },
+    selectedInfoHTML() {
+      if (!selected) return 'No piece selected';
+      const ud = selectedSticker.userData;
+      let v;
+      if (ud.value === 0)   v = '<span class="dim">empty</span>';
+      else if (ud.isGiven)  v = `<span class="given">${ud.value}</span> <span class="dim">(given)</span>`;
+      else                  v = `<span class="user">${ud.value}</span>`;
+      if (ud.type === 'center') {
+        return `<b>Selected piece</b> <span class="pill quad">Center</span><br>` +
+               `<span class="dim">Face</span> ${ud.faceReal + 1} <span class="dim">/ 12</span><br>` +
+               `<span class="dim">Piece value</span> ${v}`;
+      }
+      return `<b>Selected piece</b> <span class="pill quad">Quad</span><br>` +
+             `<span class="dim">Face</span> ${ud.faceReal + 1} <span class="dim">/ 12</span><br>` +
+             `<span class="dim">Wedge</span> ${ud.wedge + 1} <span class="dim">/ 5</span><br>` +
+             `<span class="dim">Cell</span> ${ud.slot + 1} <span class="dim">/ 9</span><br>` +
+             `<span class="dim">Piece value</span> ${v}`;
+    },
+    statsHTML() {
+      return `<span class="dim">faces</span> <span class="stat-num">12</span><br>` +
+             `<span class="dim">pieces/face</span> <span class="stat-num">46</span> <span class="dim">(1 center + 45 quads)</span><br>` +
+             `<span class="dim">total pieces</span> <span class="stat-num">${pieces.length}</span><br>` +
+             `<span class="dim">given clues</span> <span class="stat-num">${givenCount}</span><br>` +
+             `<span class="dim">your entries</span> <span class="stat-num">${userEntries}</span>`;
+    },
+  };
+  return api;
+}
+
+// ============================================================================
+//  TRUNCATED ICOSAHEDRON (soccer ball) — 12 pentagons + 20 hexagons
+//  Used by the Tuttminx shape below.
+// ============================================================================
+function buildTruncatedIcosahedronFaces(targetRadius) {
+  const phi = (1 + Math.sqrt(5)) / 2;
+  // 12 icosahedron vertices: cyclic perms of (0, ±1, ±φ).
+  const V = [];
+  for (const s1 of [-1, 1]) for (const s2 of [-1, 1]) {
+    V.push(new THREE.Vector3(0, s1, s2 * phi));
+    V.push(new THREE.Vector3(s1, s2 * phi, 0));
+    V.push(new THREE.Vector3(s1 * phi, 0, s2));
+  }
+  // Edge length squared on this ico = 4 (standard).
+  const EDGE2 = 4;
+  const N = V.length; // 12
+  const neighbors = Array.from({ length: N }, () => []);
+  for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+    if (Math.abs(V[i].distanceToSquared(V[j]) - EDGE2) < 1e-4) {
+      neighbors[i].push(j);
+      neighbors[j].push(i);
+    }
+  }
+
+  // Triangular faces of the ico (20), oriented CCW outward.
+  const triFaces = [];
+  const seen = new Set();
+  for (let i = 0; i < N; i++) {
+    const nb = neighbors[i];
+    for (let a = 0; a < nb.length; a++) for (let b = a + 1; b < nb.length; b++) {
+      const j = nb[a], k = nb[b];
+      if (!neighbors[j].includes(k)) continue;
+      const sorted = [i, j, k].sort((x, y) => x - y);
+      const key = sorted.join(',');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // Orient CCW when viewed from outside (origin → out).
+      const A = V[sorted[0]], B = V[sorted[1]], C = V[sorted[2]];
+      const cross = new THREE.Vector3().subVectors(B, A)
+        .cross(new THREE.Vector3().subVectors(C, A));
+      if (cross.dot(A) < 0) triFaces.push([sorted[0], sorted[2], sorted[1]]);
+      else                  triFaces.push([sorted[0], sorted[1], sorted[2]]);
+    }
+  }
+
+  // Sort the 5 neighbors of each vertex CCW around it (viewed from outside).
+  function neighborsCCW(vi) {
+    const c = V[vi];
+    const nrm = c.clone().normalize();
+    const ref = new THREE.Vector3().subVectors(V[neighbors[vi][0]], c);
+    const x = ref.clone().sub(nrm.clone().multiplyScalar(ref.dot(nrm))).normalize();
+    const y = new THREE.Vector3().crossVectors(nrm, x);
+    return [...neighbors[vi]].sort((a, b) => {
+      const va = new THREE.Vector3().subVectors(V[a], c);
+      const vb = new THREE.Vector3().subVectors(V[b], c);
+      return Math.atan2(va.dot(y), va.dot(x)) - Math.atan2(vb.dot(y), vb.dot(x));
+    });
+  }
+
+  const faces = [];
+
+  // Pentagon faces: 1 per original ico vertex, cut at 1/3 along each edge.
+  for (let vi = 0; vi < N; vi++) {
+    const nbs = neighborsCCW(vi);
+    const verts = nbs.map(ni => new THREE.Vector3()
+      .copy(V[vi])
+      .addScaledVector(new THREE.Vector3().subVectors(V[ni], V[vi]), 1 / 3));
+    const center = verts.reduce((acc, p) => acc.add(p), new THREE.Vector3()).multiplyScalar(1 / verts.length);
+    faces.push({ verts, center, normal: center.clone().normalize(), sides: 5 });
+  }
+
+  // Hexagon faces: 1 per original triangle. Walk around the triangle taking
+  // the two 1/3 cut points on each edge in CCW order.
+  for (const [a, b, c] of triFaces) {
+    const A = V[a], B = V[b], C = V[c];
+    const verts = [
+      new THREE.Vector3().copy(A).addScaledVector(new THREE.Vector3().subVectors(B, A), 1 / 3),
+      new THREE.Vector3().copy(B).addScaledVector(new THREE.Vector3().subVectors(A, B), 1 / 3),
+      new THREE.Vector3().copy(B).addScaledVector(new THREE.Vector3().subVectors(C, B), 1 / 3),
+      new THREE.Vector3().copy(C).addScaledVector(new THREE.Vector3().subVectors(B, C), 1 / 3),
+      new THREE.Vector3().copy(C).addScaledVector(new THREE.Vector3().subVectors(A, C), 1 / 3),
+      new THREE.Vector3().copy(A).addScaledVector(new THREE.Vector3().subVectors(C, A), 1 / 3),
+    ];
+    const center = verts.reduce((acc, p) => acc.add(p), new THREE.Vector3()).multiplyScalar(1 / verts.length);
+    faces.push({ verts, center, normal: center.clone().normalize(), sides: 6 });
+  }
+
+  // Scale so the furthest vertex sits at `targetRadius`.
+  let maxR = 0;
+  for (const f of faces) for (const v of f.verts) maxR = Math.max(maxR, v.length());
+  const k = targetRadius / maxR;
+  for (const f of faces) {
+    for (const v of f.verts) v.multiplyScalar(k);
+    f.center.multiplyScalar(k);
+  }
+  return faces;
+}
+
+// ============================================================================
+//  SUDOKU TUTTMINX — 32 faces (12 pentagons + 20 hexagons), megaminx-style
+//  per-face center + per-wedge 3×3 quads. Per-wedge 1–9 sudoku.
+// ============================================================================
+function makeTuttminxShape() {
+  let group = null;
+  let pieces = [];
+  let selected = null;
+  let selectedSticker = null;
+  let givenCount = 0, userEntries = 0;
+
+  const S_INNER = 0.32; // shared inner radius for center piece
+
+  function buildWedgeQuads(C, A, B) {
+    const sLevels = [S_INNER, S_INNER + (1 - S_INNER) / 3, S_INNER + 2 * (1 - S_INNER) / 3, 1];
+    const tLevels = [0, 1/3, 2/3, 1];
+    const _CA = new THREE.Vector3().subVectors(A, C);
+    const _CB = new THREE.Vector3().subVectors(B, C);
+    const P = (s, t) => new THREE.Vector3()
+      .copy(C)
+      .addScaledVector(_CA, s * (1 - t))
+      .addScaledVector(_CB, s * t);
+    const quads = [];
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++) {
+        quads.push([
+          P(sLevels[i],   tLevels[j]),
+          P(sLevels[i+1], tLevels[j]),
+          P(sLevels[i+1], tLevels[j+1]),
+          P(sLevels[i],   tLevels[j+1]),
+        ]);
+      }
+    return quads;
+  }
+
+  function build() {
+    group = new THREE.Group();
+    pieces = [];
+    selected = null;
+    selectedSticker = null;
+    givenCount = 0;
+    userEntries = 0;
+
+    const faces = buildTruncatedIcosahedronFaces(2.6);
+
+    const baseMatPent = new THREE.MeshStandardMaterial({
+      color: 0x6a7fc8, roughness: 0.5, metalness: 0.08, flatShading: true,
+    });
+    const baseMatHex = new THREE.MeshStandardMaterial({
+      color: 0x4f8a6e, roughness: 0.5, metalness: 0.08, flatShading: true,
+    });
+    const centerColorPent = 0x9d6cc8;
+    const centerColorHex  = 0xc89d6c;
+
+    let faceIdx = 0;
+    for (const f of faces) {
+      const C = f.center, n = f.normal;
+      const nSides = f.verts.length; // 5 or 6
+      const baseMat = (nSides === 5) ? baseMatPent : baseMatHex;
+      const centerColor = (nSides === 5) ? centerColorPent : centerColorHex;
+
+      // ----- center polygon piece -----
+      {
+        const cVerts = [];
+        for (let vi = 0; vi < nSides; vi++) {
+          cVerts.push(new THREE.Vector3()
+            .copy(C)
+            .addScaledVector(new THREE.Vector3().subVectors(f.verts[vi], C), S_INNER));
+        }
+        const xA = new THREE.Vector3().subVectors(cVerts[0], C).normalize();
+        const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+        const Mc = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
+        const Mci = new THREE.Matrix4().copy(Mc).invert();
+        const localPts = cVerts.map(v => v.clone().applyMatrix4(Mci));
+        const posArr = new Float32Array(nSides * 3);
+        for (let i = 0; i < nSides; i++) {
+          posArr[i*3+0] = localPts[i].x;
+          posArr[i*3+1] = localPts[i].y;
+          posArr[i*3+2] = localPts[i].z;
+        }
+        const idx = [];
+        for (let i = 1; i < nSides - 1; i++) idx.push(0, i, i + 1);
+        const cg = new THREE.BufferGeometry();
+        cg.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+        cg.setIndex(idx);
+        cg.computeVertexNormals();
+        const centerMat = baseMat.clone();
+        centerMat.color.setHex(centerColor);
+        const centerPiece = new THREE.Mesh(cg, centerMat);
+        centerPiece.applyMatrix4(Mc);
+        const pts2dC = localPts.map(p => [p.x, p.y]);
+        const ctr2dC = centroidOf2D(pts2dC);
+        const sizeC  = fitDigitSize(pts2dC, 0.55);
+        centerPiece.userData = {
+          type: 'center',
+          face: 100000 + faceIdx,
+          faceReal: faceIdx,
+          faceSides: nSides,
+          wedge: -1,
+          slot: -1,
+          digitLocal: { x: ctr2dC[0], y: ctr2dC[1], size: sizeC },
+          value: 0, isGiven: false, digit: null,
+        };
+        centerPiece.userData.siblings = [centerPiece];
+        const cOutline = new THREE.Mesh(makeOutlineGeom(pts2dC, 0.012, 0.003), POLY_OUTLINE_MAT);
+        cOutline.renderOrder = 1;
+        centerPiece.add(cOutline);
+        group.add(centerPiece);
+        pieces.push(centerPiece);
+      }
+
+      // ----- wedge quads -----
+      for (let wi = 0; wi < nSides; wi++) {
+        const A = f.verts[wi];
+        const B = f.verts[(wi + 1) % nSides];
+        const wedgeQuads = buildWedgeQuads(C, A, B);
+        const wedgeId = faceIdx * 16 + wi; // 16 leaves room for hex (6) without collisions
+        for (let ti = 0; ti < wedgeQuads.length; ti++) {
+          const [P0, P1, P2, P3] = wedgeQuads[ti];
+          const ctr = new THREE.Vector3().add(P0).add(P1).add(P2).add(P3).multiplyScalar(1 / 4);
+          const xA = new THREE.Vector3().subVectors(P0, ctr).normalize();
+          const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+          const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(ctr);
+          const Mi = new THREE.Matrix4().copy(M).invert();
+          const p0L = P0.clone().applyMatrix4(Mi);
+          const p1L = P1.clone().applyMatrix4(Mi);
+          const p2L = P2.clone().applyMatrix4(Mi);
+          const p3L = P3.clone().applyMatrix4(Mi);
+          const g = new THREE.BufferGeometry();
+          g.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+            p0L.x, p0L.y, p0L.z,
+            p1L.x, p1L.y, p1L.z,
+            p2L.x, p2L.y, p2L.z,
+            p3L.x, p3L.y, p3L.z,
+          ]), 3));
+          g.setIndex([0, 1, 2, 0, 2, 3]);
+          g.computeVertexNormals();
+          const piece = new THREE.Mesh(g, baseMat.clone());
+          piece.applyMatrix4(M);
+          const pts2d = [[p0L.x, p0L.y], [p1L.x, p1L.y], [p2L.x, p2L.y], [p3L.x, p3L.y]];
+          const ctr2d = centroidOf2D(pts2d);
+          const size  = fitDigitSize(pts2d, 0.70);
+          piece.userData = {
+            type: 'quad',
+            face: wedgeId,
+            faceReal: faceIdx,
+            faceSides: nSides,
+            wedge: wi,
+            slot: ti,
+            digitLocal: { x: ctr2d[0], y: ctr2d[1], size },
+            value: 0, isGiven: false, digit: null,
+          };
+          piece.userData.siblings = [piece];
+          const outline = new THREE.Mesh(makeOutlineGeom(pts2d, 0.012, 0.003), POLY_OUTLINE_MAT);
+          outline.renderOrder = 1;
+          piece.add(outline);
+          group.add(piece);
+          pieces.push(piece);
+        }
+      }
+      faceIdx++;
+    }
+
+    // Random initial givens, same rules as Megaminx 46.
+    const byWedge = new Map();
+    for (const p of pieces) {
+      if (p.userData.type === 'center') continue;
+      const w = p.userData.face;
+      if (!byWedge.has(w)) byWedge.set(w, []);
+      byWedge.get(w).push(p);
+    }
+    for (const p of pieces) {
+      if (p.userData.type !== 'center') continue;
+      if (Math.random() < 0.4) {
+        const v = 1 + Math.floor(Math.random() * 9);
+        setPieceDigit(p, v, true);
+        givenCount++;
+      }
+    }
+    for (const wedgeArr of byWedge.values()) {
+      const slots = [...wedgeArr];
+      for (let i = slots.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [slots[i], slots[j]] = [slots[j], slots[i]];
+      }
+      const givenCountPerWedge = 2 + Math.floor(Math.random() * 3);
+      const usedValues = new Set();
+      for (let k = 0; k < givenCountPerWedge; k++) {
+        let v;
+        do { v = 1 + Math.floor(Math.random() * 9); } while (usedValues.has(v));
+        usedValues.add(v);
+        setPieceDigit(slots[k], v, true);
+        givenCount++;
+      }
+    }
+  }
+
+  const api = {
+    name: 'Sudoku Tuttminx',
+    subtitle: '32 truncated-icosahedron faces (12 pentagons + 20 hexagons) — per-wedge sudoku, free centers.',
+    controlsHTML:
+      '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
+      '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
+    cameraDistance: 10,
+    install() { build(); validatePolyhedralFaces(pieces); scene.add(group); },
+    uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; selected = null; },
+    get pickables() { return pieces; },
+    pick(hit) {
+      if (selected) for (const m of selected) {
+        m.material.emissive.setHex(0x000000); m.material.emissiveIntensity = 1;
+      }
+      selectedSticker = hit ? hit.object : null;
+      selected = hit ? hit.object.userData.siblings : null;
+      if (selected) for (const m of selected) {
+        m.material.emissive = new THREE.Color(0xffd166);
+        m.material.emissiveIntensity = 0.30;
+      }
+      refreshSelected();
+    },
+    clearPick() { this.pick(null); },
+    keydown(e) {
+      return handleDigitKey(e, {
+        getTarget: () => selectedSticker,
+        onChange: (piece, value) => {
+          const prev = piece.userData.value;
+          setPieceDigit(piece, value, false);
+          if (prev === 0 && value !== 0) userEntries++;
+          else if (prev !== 0 && value === 0) userEntries--;
+          validatePolyhedralFaces(pieces);
+          refreshSelected();
+          statsEl.innerHTML = api.statsHTML();
+        },
+      });
+    },
+    frame() { updatePolyhedralDigits(pieces, group, camera); },
+    selectedInfoHTML() {
+      if (!selected) return 'No piece selected';
+      const ud = selectedSticker.userData;
+      let v;
+      if (ud.value === 0)   v = '<span class="dim">empty</span>';
+      else if (ud.isGiven)  v = `<span class="given">${ud.value}</span> <span class="dim">(given)</span>`;
+      else                  v = `<span class="user">${ud.value}</span>`;
+      const faceLabel = (ud.faceSides === 5) ? 'pentagon' : 'hexagon';
+      if (ud.type === 'center') {
+        return `<b>Selected piece</b> <span class="pill quad">Center</span><br>` +
+               `<span class="dim">Face</span> ${ud.faceReal + 1} <span class="dim">/ 32 (${faceLabel})</span><br>` +
+               `<span class="dim">Piece value</span> ${v}`;
+      }
+      return `<b>Selected piece</b> <span class="pill quad">Quad</span><br>` +
+             `<span class="dim">Face</span> ${ud.faceReal + 1} <span class="dim">/ 32 (${faceLabel})</span><br>` +
+             `<span class="dim">Wedge</span> ${ud.wedge + 1} <span class="dim">/ ${ud.faceSides}</span><br>` +
+             `<span class="dim">Cell</span> ${ud.slot + 1} <span class="dim">/ 9</span><br>` +
+             `<span class="dim">Piece value</span> ${v}`;
+    },
+    statsHTML() {
+      return `<span class="dim">faces</span> <span class="stat-num">32</span> <span class="dim">(12 pent + 20 hex)</span><br>` +
+             `<span class="dim">pentagons</span> <span class="stat-num">46</span> <span class="dim">pieces each (1+45)</span><br>` +
+             `<span class="dim">hexagons</span> <span class="stat-num">55</span> <span class="dim">pieces each (1+54)</span><br>` +
+             `<span class="dim">total pieces</span> <span class="stat-num">${pieces.length}</span><br>` +
+             `<span class="dim">given clues</span> <span class="stat-num">${givenCount}</span><br>` +
+             `<span class="dim">your entries</span> <span class="stat-num">${userEntries}</span>`;
+    },
+  };
+  return api;
+}
+
+// ============================================================================
+//  SUDOKU TERAMINX — dodecahedron, megaminx base with each piece subdivided.
+//  Per face:  1 center pentagon
+//           + 5 edge "stacks" (each = 3 trapezoid strips, tapering outward)
+//           + 5 corner diamonds (each = 3×3 grid = 9 cells)
+//           = 1 + 15 + 45 = 61 cells per face. 12 × 61 = 732 cells total.
+//  Sudoku rule: each corner 3×3 is a 1–9 box; edge strips & centers
+//  carry decorative givens.
+// ============================================================================
+function makeTeraminxShape() {
+  let group = null;
+  let pieces = [];
+  let selected = null;
+  let selectedSticker = null;
+  let givenCount = 0, userEntries = 0;
+
+  // Megaminx base parameters.
+  // The inner pentagon has vertices on the rays from face center C through
+  // each face vertex V[i], at fraction CENTER_RADIUS. Each edge "stack" is a
+  // trapezoid whose inner edge runs along one side of the inner pentagon and
+  // whose outer edge is the middle (1−2·ALPHA) of one face edge. With
+  // CENTER_RADIUS > 1−2·ALPHA the inner edge is LONGER than the outer edge,
+  // so the slanted sides converge OUTWARD (toward the face perimeter) and
+  // each strip's tangential width shrinks moving outward.
+  const CENTER_RADIUS = 0.42;
+  // ALPHA = fraction of each face edge the corner-diamond claims at each end.
+  const ALPHA = 0.36;
+  // Subdivision counts.
+  const EDGE_STRIPS = 3;   // each edge trapezoid → 3 radial strips
+  const CORNER_N    = 3;   // each corner diamond → 3×3 grid (9 cells)
+  // Radial cut points (fractions along inner→outer) for the edge strips.
+  // All three strips have equal radial height; only their tangential width
+  // changes (shrinking outward thanks to the trapezoid taper).
+  const EDGE_CUTS = [0.00, 1 / 3, 2 / 3, 1.00];
+
+  function lerp3(C, V, t) {
+    return new THREE.Vector3()
+      .copy(C)
+      .addScaledVector(new THREE.Vector3().subVectors(V, C), t);
+  }
+  function lerpV3(A, B, t) {
+    return new THREE.Vector3()
+      .copy(A)
+      .addScaledVector(new THREE.Vector3().subVectors(B, A), t);
+  }
+  // Bilinear interpolation over a quad with CCW corners [P00, P10, P11, P01].
+  function bilerpV3(P00, P10, P11, P01, u, v) {
+    const bottom = lerpV3(P00, P10, u);
+    const top    = lerpV3(P01, P11, u);
+    return lerpV3(bottom, top, v);
+  }
+
+  // Build a flat quad piece from 4 world-space corner points (assumed
+  // CCW viewed from outside, i.e. cross(P1-P0, P2-P0) ⋅ n > 0).
+  function makeQuadPiece(P0, P1, P2, P3, n, baseMat, ud) {
+    const ctr = new THREE.Vector3().add(P0).add(P1).add(P2).add(P3).multiplyScalar(0.25);
+    const xA = new THREE.Vector3().subVectors(P0, ctr).normalize();
+    const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+    const M  = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(ctr);
+    const Mi = new THREE.Matrix4().copy(M).invert();
+    const p0L = P0.clone().applyMatrix4(Mi);
+    const p1L = P1.clone().applyMatrix4(Mi);
+    const p2L = P2.clone().applyMatrix4(Mi);
+    const p3L = P3.clone().applyMatrix4(Mi);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+      p0L.x, p0L.y, p0L.z,
+      p1L.x, p1L.y, p1L.z,
+      p2L.x, p2L.y, p2L.z,
+      p3L.x, p3L.y, p3L.z,
+    ]), 3));
+    g.setIndex([0, 1, 2, 0, 2, 3]);
+    g.computeVertexNormals();
+    const piece = new THREE.Mesh(g, baseMat.clone());
+    piece.applyMatrix4(M);
+    const pts2d = [[p0L.x, p0L.y], [p1L.x, p1L.y], [p2L.x, p2L.y], [p3L.x, p3L.y]];
+    const ctr2d = centroidOf2D(pts2d);
+    const size  = fitDigitSize(pts2d, 0.70);
+    ud.digitLocal = { x: ctr2d[0], y: ctr2d[1], size };
+    ud.value = 0; ud.isGiven = false; ud.digit = null;
+    piece.userData = ud;
+    piece.userData.siblings = [piece];
+    const outline = new THREE.Mesh(makeOutlineGeom(pts2d, 0.012, 0.003), POLY_OUTLINE_MAT);
+    outline.renderOrder = 1;
+    piece.add(outline);
+    return piece;
+  }
+
+  function build() {
+    group = new THREE.Group();
+    pieces = [];
+    selected = null;
+    selectedSticker = null;
+    givenCount = 0;
+    userEntries = 0;
+
+    const sourceGeom = new THREE.DodecahedronGeometry(2.5);
+    const faces = extractPolyhedralFaces(sourceGeom);
+    sourceGeom.dispose();
+
+    // 3 growing edge-strip materials (lightening outward) + 3×3 corner
+    // materials (slight per-cell variation for visual depth).
+    const edgeMats = [
+      new THREE.MeshStandardMaterial({ color: 0x5a73c0, roughness: 0.5, metalness: 0.08, flatShading: true }),
+      new THREE.MeshStandardMaterial({ color: 0x7387d0, roughness: 0.5, metalness: 0.08, flatShading: true }),
+      new THREE.MeshStandardMaterial({ color: 0x8c9be0, roughness: 0.5, metalness: 0.08, flatShading: true }),
+    ];
+    const cornerMat = new THREE.MeshStandardMaterial({
+      color: 0xa07acc, roughness: 0.5, metalness: 0.08, flatShading: true,
+    });
+    const centerMat = new THREE.MeshStandardMaterial({
+      color: 0xc89d4a, roughness: 0.5, metalness: 0.08, flatShading: true,
+    });
+
+    let faceIdx = 0;
+    for (const f of faces) {
+      const C = f.center, n = f.normal;
+
+      // ----- central pentagon piece -----
+      {
+        const verts = f.verts.map(v => lerp3(C, v, CENTER_RADIUS));
+        const xA = new THREE.Vector3().subVectors(verts[0], C).normalize();
+        const yA = new THREE.Vector3().crossVectors(n, xA).normalize();
+        const Mc = new THREE.Matrix4().makeBasis(xA, yA, n).setPosition(C);
+        const Mci = new THREE.Matrix4().copy(Mc).invert();
+        const localPts = verts.map(v => v.clone().applyMatrix4(Mci));
+        const posArr = new Float32Array(15);
+        for (let i = 0; i < 5; i++) {
+          posArr[i*3+0] = localPts[i].x;
+          posArr[i*3+1] = localPts[i].y;
+          posArr[i*3+2] = localPts[i].z;
+        }
+        const cg = new THREE.BufferGeometry();
+        cg.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+        cg.setIndex([0, 1, 2, 0, 2, 3, 0, 3, 4]);
+        cg.computeVertexNormals();
+        const centerPiece = new THREE.Mesh(cg, centerMat.clone());
+        centerPiece.applyMatrix4(Mc);
+        const pts2dC = localPts.map(p => [p.x, p.y]);
+        const ctr2dC = centroidOf2D(pts2dC);
+        const sizeC  = fitDigitSize(pts2dC, 0.55);
+        centerPiece.userData = {
+          type: 'center',
+          face: faceIdx * 1000,
+          faceReal: faceIdx,
+          digitLocal: { x: ctr2dC[0], y: ctr2dC[1], size: sizeC },
+          value: 0, isGiven: false, digit: null,
+        };
+        centerPiece.userData.siblings = [centerPiece];
+        const cOutline = new THREE.Mesh(makeOutlineGeom(pts2dC, 0.012, 0.003), POLY_OUTLINE_MAT);
+        cOutline.renderOrder = 1;
+        centerPiece.add(cOutline);
+        group.add(centerPiece);
+        pieces.push(centerPiece);
+      }
+
+      // Megaminx-base annular geometry: inner pentagon + outer (face) vertices
+      // plus per-edge cut points.
+      const I = f.verts.map(v => lerp3(C, v, CENTER_RADIUS));
+      const O = f.verts.map(v => v.clone());
+      const Y = [], X = [];
+      for (let i = 0; i < 5; i++) {
+        const a = O[i], b = O[(i + 1) % 5];
+        Y.push(lerpV3(a, b, ALPHA));        // near O[i] on edge i
+        X.push(lerpV3(a, b, 1 - ALPHA));    // near O[i+1] on edge i
+      }
+
+      // ----- 5 edge stacks. Each stack is a trapezoid whose slanted sides
+      //       go from inner-pentagon corner I[i]/I[i+1] outward to the
+      //       face-edge cut points Y[i]/X[i]. With CENTER_RADIUS > 1−2·ALPHA
+      //       the stack is WIDER on the inside than on the outside, so its
+      //       sides converge outward and every successive sub-strip is
+      //       tangentially narrower than the previous one.
+      for (let i = 0; i < 5; i++) {
+        const innerLeft  = I[i];
+        const innerRight = I[(i + 1) % 5];
+        const outerLeft  = Y[i];
+        const outerRight = X[i];
+        for (let s = 0; s < EDGE_STRIPS; s++) {
+          const t0 = EDGE_CUTS[s];
+          const t1 = EDGE_CUTS[s + 1];
+          // CCW from outside: inner-left, outer-left, outer-right, inner-right.
+          const P0 = lerpV3(innerLeft,  outerLeft,  t0);
+          const P1 = lerpV3(innerLeft,  outerLeft,  t1);
+          const P2 = lerpV3(innerRight, outerRight, t1);
+          const P3 = lerpV3(innerRight, outerRight, t0);
+          const strip = makeQuadPiece(
+            P0, P1, P2, P3,
+            n,
+            edgeMats[s],
+            {
+              type: 'trapezoid',
+              face: faceIdx * 1000 + 100 + i * 10 + s,
+              faceReal: faceIdx,
+              edgeIdx: i,
+              strip: s,
+            },
+          );
+          group.add(strip);
+          pieces.push(strip);
+        }
+      }
+
+      // ----- 5 corner diamonds. Each diamond [I_i, X_{i−1}, O_i, Y_i] (CCW
+      //       from outside) is subdivided into a 3×3 grid forming one Sudoku
+      //       box. The diamond naturally tapers (its width shrinks) toward
+      //       the face vertex O_i.
+      for (let i = 0; i < 5; i++) {
+        const P00 = I[i];                       // inner vertex (radially in)
+        const P10 = X[(i - 1 + 5) % 5];         // side cut (CCW-previous edge)
+        const P11 = O[i];                       // outer vertex (face corner)
+        const P01 = Y[i];                       // side cut (CCW-next edge)
+        for (let cu = 0; cu < CORNER_N; cu++) {
+          for (let cv = 0; cv < CORNER_N; cv++) {
+            const u0 = cu / CORNER_N, u1 = (cu + 1) / CORNER_N;
+            const v0 = cv / CORNER_N, v1 = (cv + 1) / CORNER_N;
+            const Q0 = bilerpV3(P00, P10, P11, P01, u0, v0);
+            const Q1 = bilerpV3(P00, P10, P11, P01, u1, v0);
+            const Q2 = bilerpV3(P00, P10, P11, P01, u1, v1);
+            const Q3 = bilerpV3(P00, P10, P11, P01, u0, v1);
+            const cell = makeQuadPiece(
+              Q0, Q1, Q2, Q3,
+              n,
+              cornerMat,
+              {
+                type: 'diamond',
+                // All 9 cells share `face` → validatePolyhedralFaces enforces
+                // 1–9 uniqueness per corner (sudoku 3×3 box).
+                face: faceIdx * 1000 + 500 + i,
+                faceReal: faceIdx,
+                cornerIdx: i,
+                cellU: cu,
+                cellV: cv,
+              },
+            );
+            group.add(cell);
+            pieces.push(cell);
+          }
+        }
+      }
+
+      faceIdx++;
+    }
+
+    // Randomly seed each corner-box with 3–5 distinct givens. Edge strips
+    // and centers each get a 35% chance of a random given for visual
+    // variety (no shared uniqueness constraint).
+    const byCorner = new Map();
+    for (const p of pieces) {
+      if (p.userData.type !== 'diamond') continue;
+      const key = p.userData.face;
+      if (!byCorner.has(key)) byCorner.set(key, []);
+      byCorner.get(key).push(p);
+    }
+    for (const cells of byCorner.values()) {
+      const shuffled = [...cells];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      const reveal = 3 + Math.floor(Math.random() * 3); // 3..5 givens / corner box
+      const used = new Set();
+      let placed = 0, k = 0;
+      while (placed < reveal && k < shuffled.length) {
+        let v;
+        do { v = 1 + Math.floor(Math.random() * 9); } while (used.has(v));
+        used.add(v);
+        setPieceDigit(shuffled[k], v, true);
+        givenCount++;
+        placed++;
+        k++;
+      }
+    }
+    for (const p of pieces) {
+      if (p.userData.type === 'diamond') continue;
+      if (Math.random() < 0.35) {
+        const v = 1 + Math.floor(Math.random() * 9);
+        setPieceDigit(p, v, true);
+        givenCount++;
+      }
+    }
+  }
+
+  const api = {
+    name: 'Sudoku Teraminx',
+    subtitle: '12 dodecahedral faces × 61 pieces (1 center + 5 edge stacks × 3 strips + 5 corners × 3×3). Each corner is one Sudoku box.',
+    controlsHTML:
+      '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
+      '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
+    cameraDistance: 9,
+    install() { build(); validatePolyhedralFaces(pieces); scene.add(group); },
+    uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; selected = null; },
+    get pickables() { return pieces; },
+    pick(hit) {
+      if (selected) for (const m of selected) {
+        m.material.emissive.setHex(0x000000); m.material.emissiveIntensity = 1;
+      }
+      selectedSticker = hit ? hit.object : null;
+      selected = hit ? hit.object.userData.siblings : null;
+      if (selected) for (const m of selected) {
+        m.material.emissive = new THREE.Color(0xffd166);
+        m.material.emissiveIntensity = 0.30;
+      }
+      refreshSelected();
+    },
+    clearPick() { this.pick(null); },
+    keydown(e) {
+      return handleDigitKey(e, {
+        getTarget: () => selectedSticker,
+        onChange: (piece, value) => {
+          const prev = piece.userData.value;
+          setPieceDigit(piece, value, false);
+          if (prev === 0 && value !== 0) userEntries++;
+          else if (prev !== 0 && value === 0) userEntries--;
+          validatePolyhedralFaces(pieces);
+          refreshSelected();
+          statsEl.innerHTML = api.statsHTML();
+        },
+      });
+    },
+    frame() { updatePolyhedralDigits(pieces, group, camera); },
+    selectedInfoHTML() {
+      if (!selected) return 'No piece selected';
+      const ud = selectedSticker.userData;
+      let v;
+      if (ud.value === 0)   v = '<span class="dim">empty</span>';
+      else if (ud.isGiven)  v = `<span class="given">${ud.value}</span> <span class="dim">(given)</span>`;
+      else                  v = `<span class="user">${ud.value}</span>`;
+      const typeLabel =
+        ud.type === 'center'    ? 'Center'         :
+        ud.type === 'trapezoid' ? 'Edge strip'     :
+        ud.type === 'diamond'   ? 'Corner cell'    : 'Piece';
+      const detail =
+        ud.type === 'center'    ? '' :
+        ud.type === 'trapezoid' ? `<span class="dim">Edge ${ud.edgeIdx + 1}/5 · strip ${ud.strip + 1}/3 (tapering outward)</span><br>` :
+                                  `<span class="dim">Corner ${ud.cornerIdx + 1}/5 · cell (${ud.cellU + 1},${ud.cellV + 1}) of 3×3 sudoku box</span><br>`;
+      return `<b>Selected piece</b> <span class="pill quad">${typeLabel}</span><br>` +
+             `<span class="dim">Face</span> ${ud.faceReal + 1} <span class="dim">/ 12</span><br>` +
+             detail +
+             `<span class="dim">Piece value</span> ${v}`;
+    },
+    statsHTML() {
+      return `<span class="dim">faces</span> <span class="stat-num">12</span> <span class="dim">pentagons</span><br>` +
+             `<span class="dim">pieces/face</span> <span class="stat-num">61</span> <span class="dim">(1 + 5×3 + 5×9)</span><br>` +
+             `<span class="dim">total pieces</span> <span class="stat-num">${pieces.length}</span><br>` +
+             `<span class="dim">given clues</span> <span class="stat-num">${givenCount}</span><br>` +
+             `<span class="dim">your entries</span> <span class="stat-num">${userEntries}</span>`;
+    },
+  };
+  return api;
+}
+
+// ============================================================================
 //  REGISTER ALL SHAPES
 // ============================================================================
 SHAPES.push(makeCubeShape(4));
 SHAPES.push(makeCubeShape(9));
 
 // SHAPES.push(makeKilominxShape()); // hidden
+
+SHAPES.push(makeKilominx45Shape());
+SHAPES.push(makeTuttminxShape());
+SHAPES.push(makeTeraminxShape());
 
 SHAPES.push(makeMinxLikeShape({
   name: 'Sudoku Megaminx',
