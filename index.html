@@ -461,14 +461,22 @@ function setPieceDigit(piece, value, isGiven, isConflict = false) {
 function validatePolyhedralFaces(pieces) {
   const byFace = new Map();
   for (const p of pieces) {
-    const f = p.userData.face;
-    if (!byFace.has(f)) byFace.set(f, []);
-    byFace.get(f).push(p);
+    const fids = [p.userData.face];
+    if (p.userData.extraFaces) for (const f of p.userData.extraFaces) fids.push(f);
+    for (const f of fids) {
+      if (!byFace.has(f)) byFace.set(f, []);
+      byFace.get(f).push(p);
+    }
   }
   const conflicts = new Set();
   for (const list of byFace.values()) {
     const seen = new Map();
+    const sibSeen = new Set(); // dedupe sibling groups within a face/chain
     for (const p of list) {
+      const sibKey = (p.userData.siblings && p.userData.siblings.length)
+        ? p.userData.siblings[0] : p;
+      if (sibSeen.has(sibKey)) continue;
+      sibSeen.add(sibKey);
       const v = p.userData.value;
       if (!v) continue;
       if (!seen.has(v)) seen.set(v, []);
@@ -648,7 +656,7 @@ const Sudoku = (() => {
   // `deadlineMs` aborts long solves and returns the current best-effort
   // assignment (some 0s may remain) so the UI never freezes.
   function solve(numVars, alphabet, groups, opts = {}) {
-    const { deadlineMs = 250 } = opts;
+    const { deadlineMs = 250, allowForcedEmpty = true } = opts;
     const assignment = new Array(numVars).fill(null); // null = untouched
 
     // For each var, which groups contain it.
@@ -685,6 +693,10 @@ const Sudoku = (() => {
       }
       if (pick === -1) return true;
       if (pickDom.length === 0) {
+        // Cell has no legal value. For pigeonhole-blocked shapes we accept a
+        // forced-empty (0) here; otherwise treat it as a dead-end and
+        // backtrack so fully-fillable shapes never leave incomplete regions.
+        if (!allowForcedEmpty) return false;
         assignment[pick] = 0;
         const r = step();
         if (r === true || r === 'timeout') return r;
@@ -711,7 +723,7 @@ const Sudoku = (() => {
   // Groups pieces by sibling-set (one CSP variable per sibling group), then
   // builds one constraint group per unique value of `userData[faceField]`
   // among those siblings. Returns Map<piece, assignedValue> (0 = empty).
-  function solvePolyhedral(pieces, { faceField = 'face', deadlineMs = 250 } = {}) {
+  function solvePolyhedral(pieces, { faceField = 'face', extraFacesField = 'extraFaces', deadlineMs = 250, allowForcedEmpty = true } = {}) {
     const seen = new Set();
     const vars = []; // each: { siblings: [], faces: Set }
     for (const p of pieces) {
@@ -719,7 +731,11 @@ const Sudoku = (() => {
       const sibs = (p.userData.siblings && p.userData.siblings.length) ? p.userData.siblings : [p];
       for (const s of sibs) seen.add(s);
       const fset = new Set();
-      for (const s of sibs) fset.add(s.userData[faceField]);
+      for (const s of sibs) {
+        fset.add(s.userData[faceField]);
+        const extra = s.userData[extraFacesField];
+        if (extra) for (const f of extra) fset.add(f);
+      }
       vars.push({ siblings: sibs, faces: fset });
     }
     const faceToGroup = new Map();
@@ -732,7 +748,7 @@ const Sudoku = (() => {
       }
     });
     const alphabet = [1,2,3,4,5,6,7,8,9];
-    const assn = solve(vars.length, alphabet, groups, { deadlineMs });
+    const assn = solve(vars.length, alphabet, groups, { deadlineMs, allowForcedEmpty });
     const out = new Map();
     for (let i = 0; i < vars.length; i++) {
       const val = assn[i];
@@ -1966,7 +1982,7 @@ function makeKilominx45Shape() {
         getTarget: () => selectedSticker,
         onChange: (piece, value) => {
           const prev = piece.userData.value;
-          setPieceDigit(piece, value, false);
+          for (const sib of piece.userData.siblings) setPieceDigit(sib, value, false);
           if (prev === 0 && value !== 0) userEntries++;
           else if (prev !== 0 && value === 0) userEntries--;
           validatePolyhedralFaces(pieces);
@@ -2313,7 +2329,7 @@ function makeTuttminxShape() {
         getTarget: () => selectedSticker,
         onChange: (piece, value) => {
           const prev = piece.userData.value;
-          setPieceDigit(piece, value, false);
+          for (const sib of piece.userData.siblings) setPieceDigit(sib, value, false);
           if (prev === 0 && value !== 0) userEntries++;
           else if (prev !== 0 && value === 0) userEntries--;
           validatePolyhedralFaces(pieces);
@@ -2373,6 +2389,10 @@ function makeTeraminxShape(opts = {}) {
     // stack are rendered as dark "blocked" pieces — non-pickable, no digits,
     // not validated. Used by Elite Kilominx to hide the centers.
     blockInner = false,
+    // When true, chain diamond rows across face edges into shared row
+    // constraints (each chain = 6 cells across 2 adjacent corner-boxes,
+    // 1-9 distinct).
+    rowConstraints = false,
   } = opts;
 
   let group = null;
@@ -2602,6 +2622,11 @@ function makeTeraminxShape(opts = {}) {
                 cornerIdx: i,
                 cellU: cu,
                 cellV: cv,
+                // Edge-side midpoints for cross-face row chaining (rowEdgeI:
+                // row of constant cellU, ends on face edge i; rowEdgeIm1:
+                // row of constant cellV, ends on face edge i-1).
+                rowEndI:    lerpV3(P01, P11, (cu + 0.5) / CORNER_N),
+                rowEndIm1:  lerpV3(P10, P11, (cv + 0.5) / CORNER_N),
               },
             );
             group.add(cell);
@@ -2614,12 +2639,108 @@ function makeTeraminxShape(opts = {}) {
     }
   }
 
+  // Merge the three corner-TIP cells that meet at each dodecahedron vertex
+  // into one physical piece (a real corner piece has 3 stickers). The
+  // generic edge-merge only unions pieces sharing a full edge (2 vertices);
+  // the outermost diamond cell of each corner touches its two neighbours
+  // only at the single polyhedron vertex, and POLY_KEY float-rounding lets a
+  // few of those edge-unions slip, so we explicitly group the tips here by
+  // the world position of their outer vertex (geometry vertex index 2 = O_i).
+  function mergeCornerTipsByVertex() {
+    const TIP = CORNER_N - 1;
+    const tips = pieces.filter(p =>
+      p.userData.type === 'diamond' &&
+      p.userData.cellU === TIP && p.userData.cellV === TIP);
+    const tmp = new THREE.Vector3();
+    // Coarser rounding than POLY_KEY: dodeca vertices are far apart (>1 unit),
+    // so 0.01 resolution reliably clusters the 3 coincident tips per vertex.
+    const vertKey = v => `${Math.round(v.x * 100)},${Math.round(v.y * 100)},${Math.round(v.z * 100)}`;
+    const byVert = new Map();
+    for (const c of tips) {
+      c.updateMatrixWorld(true);
+      const pos = c.geometry.getAttribute('position');
+      tmp.fromBufferAttribute(pos, 2).applyMatrix4(c.matrixWorld); // vertex 2 = O_i
+      const k = vertKey(tmp);
+      if (!byVert.has(k)) byVert.set(k, []);
+      byVert.get(k).push(c);
+    }
+    for (const list of byVert.values()) {
+      if (list.length < 2) continue;
+      // Fuse the existing sibling sets of every tip meeting here.
+      const merged = [];
+      const seen = new Set();
+      for (const c of list) {
+        const sibs = (c.userData.siblings && c.userData.siblings.length) ? c.userData.siblings : [c];
+        for (const s of sibs) { if (!seen.has(s)) { seen.add(s); merged.push(s); } }
+      }
+      for (const s of merged) s.userData.siblings = merged;
+      // Propagate any digit already set so the linked stickers agree.
+      let val = 0, given = false;
+      for (const m of merged) {
+        if (m.userData.value) { val = m.userData.value; given = !!m.userData.isGiven; break; }
+      }
+      if (val) for (const m of merged) setPieceDigit(m, val, given);
+    }
+  }
+
+  // Cross-face row constraints (rowConstraints opt). Each diamond cell sits
+  // in two rows (constant-cellU and constant-cellV); each row has one end on
+  // a face edge. Two rows from adjacent faces whose edge-end midpoints
+  // coincide get unioned into a single "row chain" group of 6 cells.
+  function buildRowGroups() {
+    const diamonds = pieces.filter(p => p.userData.type === 'diamond');
+    // Per row-id, list its 3 cells and its edge-endpoint world position.
+    const rowsById = new Map(); // rowId -> { cells: [], edgePos }
+    function rowKey(faceReal, cornerIdx, axis, idx) {
+      return `${faceReal}|${cornerIdx}|${axis}|${idx}`;
+    }
+    for (const cell of diamonds) {
+      const ud = cell.userData;
+      const rU = rowKey(ud.faceReal, ud.cornerIdx, 'u', ud.cellU);
+      const rV = rowKey(ud.faceReal, ud.cornerIdx, 'v', ud.cellV);
+      if (!rowsById.has(rU)) rowsById.set(rU, { cells: [], edgePos: ud.rowEndI.clone() });
+      if (!rowsById.has(rV)) rowsById.set(rV, { cells: [], edgePos: ud.rowEndIm1.clone() });
+      rowsById.get(rU).cells.push(cell);
+      rowsById.get(rV).cells.push(cell);
+    }
+    // Chain rows across faces by spatial proximity of their edgePos.
+    const ids = [...rowsById.keys()];
+    const parent = new Map(ids.map(id => [id, id]));
+    const find = id => { while (parent.get(id) !== id) { parent.set(id, parent.get(parent.get(id))); id = parent.get(id); } return id; };
+    const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); };
+    const posKey = v => `${Math.round(v.x * 100)},${Math.round(v.y * 100)},${Math.round(v.z * 100)}`;
+    const byPos = new Map();
+    for (const id of ids) {
+      const k = posKey(rowsById.get(id).edgePos);
+      if (!byPos.has(k)) byPos.set(k, []);
+      byPos.get(k).push(id);
+    }
+    for (const list of byPos.values()) {
+      for (let i = 1; i < list.length; i++) union(list[0], list[i]);
+    }
+    // Assign extraFaces to each cell using the row chain's representative id.
+    for (const id of ids) {
+      const root = find(id);
+      const tag = `R:${root}`;
+      for (const cell of rowsById.get(id).cells) {
+        if (!cell.userData.extraFaces) cell.userData.extraFaces = [];
+        if (!cell.userData.extraFaces.includes(tag)) cell.userData.extraFaces.push(tag);
+      }
+    }
+  }
+
   // Solvable givens. Corner-box diamond cells share a `face` ID per corner
   // (one 1–9 sudoku box); edge strips and centers each carry a unique
   // `face` ID so they're trivially satisfied as single-cell groups.
   function seedGivens() {
     givenCount = 0;
-    const solved = Sudoku.solvePolyhedral(pieces, { faceField: 'face' });
+    // With row constraints the puzzle is fully solvable, so forbid
+    // forced-empty cells — every corner box must contain all 9 digits.
+    const solved = Sudoku.solvePolyhedral(pieces, {
+      faceField: 'face',
+      allowForcedEmpty: !rowConstraints,
+      deadlineMs: rowConstraints ? 4000 : 250,
+    });
     const seen = new Set();
     for (const p of pieces) {
       if (seen.has(p)) continue;
@@ -2643,7 +2764,7 @@ function makeTeraminxShape(opts = {}) {
       '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
       '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
     cameraDistance: 9,
-    install() { build(); mergeSiblingsByPolyhedronEdge(pieces); seedGivens(); validatePolyhedralFaces(pieces); scene.add(group); },
+    install() { build(); mergeSiblingsByPolyhedronEdge(pieces); mergeCornerTipsByVertex(); if (rowConstraints) buildRowGroups(); seedGivens(); validatePolyhedralFaces(pieces); scene.add(group); },
     uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; selected = null; },
     get pickables() { return pieces; },
     pick(hit) {
@@ -2664,7 +2785,7 @@ function makeTeraminxShape(opts = {}) {
         getTarget: () => selectedSticker,
         onChange: (piece, value) => {
           const prev = piece.userData.value;
-          setPieceDigit(piece, value, false);
+          for (const sib of piece.userData.siblings) setPieceDigit(sib, value, false);
           if (prev === 0 && value !== 0) userEntries++;
           else if (prev !== 0 && value === 0) userEntries--;
           validatePolyhedralFaces(pieces);
@@ -2723,17 +2844,18 @@ registerShape(makeCubeShape(9), 'Sudoku Cube');
 
 registerShape(makeKilominx45Shape(), 'Sudoku Tuttminx');
 registerShape(makeTuttminxShape(), 'Sudoku Tuttminx');
-registerShape(makeTeraminxShape(), 'Sudoku Megaminx');
+// registerShape(makeTeraminxShape(), 'Sudoku Megaminx'); // hidden (full Teraminx)
 registerShape(makeTeraminxShape({
-  name: 'Sudoku Elite Kilominx',
-  subtitle: '12 dodecahedral faces. Same layout as the Teraminx but the central pentagon AND all three edge strips of every stack are shrunk down and blocked off — only the 5 corner sudoku boxes per face (45 cells) are playable.',
+  name: 'Sudoku Teraminx',
+  subtitle: '12 dodecahedral faces. The central pentagon AND all three edge strips of every stack are shrunk down and blocked off — only the 5 corner sudoku boxes per face (45 cells) are playable. Each row of 3 cells also chains across the face edge into the adjacent corner-box for a 6-cell row constraint.',
   // Very small inner pentagon → the entire blocked center column (pentagon
   // + all three edge strips of every stack) is tiny, leaving the corner
   // diamonds to dominate the face.
   centerRadius: 0.12,
   alpha: 0.42,
   blockInner: true,
-}), 'Sudoku Kilominx');
+  rowConstraints: true,
+}), 'Sudoku Teraminx');
 
 registerShape(makeMinxLikeShape({
   name: 'Sudoku Megaminx',
