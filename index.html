@@ -2639,6 +2639,50 @@ function makeTeraminxShape(opts = {}) {
     }
   }
 
+  // Merge diamond CELLS that share a full edge across a dodecahedron edge
+  // into one physical piece (every boundary cell is shared by 2 faces). The
+  // generic mergeSiblingsByPolyhedronEdge keys on POLY_KEY (×1000 rounding)
+  // and float error from the world-matrix transforms silently drops ~46 of
+  // the boundary pairs, so clicking such a cell highlights only one face.
+  // Here we union by the COARSE-rounded world midpoint of each cell edge:
+  // an edge midpoint shared by cells of >1 face is a true cross-face seam.
+  function mergeDiamondEdgesByMidpoint() {
+    const diamonds = pieces.filter(p => p.userData.type === 'diamond');
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), mid = new THREE.Vector3();
+    const midKey = v => `${Math.round(v.x * 100)},${Math.round(v.y * 100)},${Math.round(v.z * 100)}`;
+    const byMid = new Map();
+    for (const c of diamonds) {
+      c.updateMatrixWorld(true);
+      const pos = c.geometry.getAttribute('position');
+      const n = pos.count;
+      for (let i = 0; i < n; i++) {
+        a.fromBufferAttribute(pos, i).applyMatrix4(c.matrixWorld);
+        b.fromBufferAttribute(pos, (i + 1) % n).applyMatrix4(c.matrixWorld);
+        mid.addVectors(a, b).multiplyScalar(0.5);
+        const k = midKey(mid);
+        if (!byMid.has(k)) byMid.set(k, []);
+        byMid.get(k).push(c);
+      }
+    }
+    for (const list of byMid.values()) {
+      const faces = new Set(list.map(c => c.userData.faceReal));
+      if (faces.size < 2) continue; // same-face interior edge → not a seam
+      // Fuse the sibling sets of every cell meeting on this cross-face edge.
+      const merged = [];
+      const seen = new Set();
+      for (const c of list) {
+        const sibs = (c.userData.siblings && c.userData.siblings.length) ? c.userData.siblings : [c];
+        for (const s of sibs) { if (!seen.has(s)) { seen.add(s); merged.push(s); } }
+      }
+      for (const s of merged) s.userData.siblings = merged;
+      let val = 0, given = false;
+      for (const m of merged) {
+        if (m.userData.value) { val = m.userData.value; given = !!m.userData.isGiven; break; }
+      }
+      if (val) for (const m of merged) setPieceDigit(m, val, given);
+    }
+  }
+
   // Merge the three corner-TIP cells that meet at each dodecahedron vertex
   // into one physical piece (a real corner piece has 3 stickers). The
   // generic edge-merge only unions pieces sharing a full edge (2 vertices);
@@ -2764,7 +2808,7 @@ function makeTeraminxShape(opts = {}) {
       '<kbd>left-click</kbd> select &nbsp; <kbd>1</kbd>–<kbd>9</kbd> fill &nbsp; <kbd>0</kbd>/<kbd>⌫</kbd> clear<br>' +
       '<kbd>right-drag</kbd> rotate &nbsp; <kbd>scroll</kbd> zoom',
     cameraDistance: 9,
-    install() { build(); mergeSiblingsByPolyhedronEdge(pieces); mergeCornerTipsByVertex(); if (rowConstraints) buildRowGroups(); seedGivens(); validatePolyhedralFaces(pieces); scene.add(group); },
+    install() { build(); mergeSiblingsByPolyhedronEdge(pieces); mergeDiamondEdgesByMidpoint(); mergeCornerTipsByVertex(); if (rowConstraints) buildRowGroups(); seedGivens(); validatePolyhedralFaces(pieces); scene.add(group); },
     uninstall() { scene.remove(group); disposeGroup(group); group = null; pieces = []; selectedSticker = null; selected = null; },
     get pickables() { return pieces; },
     pick(hit) {
