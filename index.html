@@ -2727,48 +2727,39 @@ function makeTeraminxShape(opts = {}) {
     }
   }
 
-  // Cross-face row constraints (rowConstraints opt). Each diamond cell sits
-  // in two rows (constant-cellU and constant-cellV); each row has one end on
-  // a face edge. Two rows from adjacent faces whose edge-end midpoints
-  // coincide get unioned into a single "row chain" group of 6 cells.
+  // In-face row constraints (rowConstraints opt). Along each pentagon edge i
+  // the two corner boxes that flank it (box i near vertex O_i and box i+1
+  // near vertex O_{i+1}) are separated by the blocked edge strip. The
+  // outermost cell-row of box i that runs along edge i (cellV = CORNER_N-1)
+  // and the outermost cell-column of box i+1 that runs along edge i
+  // (cellU = CORNER_N-1) form one straight line crossing that blocked strip:
+  //   O_i …[box i: 3 cells]… Y_i —[hidden strip]— X_i …[box i+1: 3 cells]… O_{i+1}
+  // Those 6 cells must hold 6 distinct digits. 5 lines per face × 12 = 60.
   function buildRowGroups() {
-    const diamonds = pieces.filter(p => p.userData.type === 'diamond');
-    // Per row-id, list its 3 cells and its edge-endpoint world position.
-    const rowsById = new Map(); // rowId -> { cells: [], edgePos }
-    function rowKey(faceReal, cornerIdx, axis, idx) {
-      return `${faceReal}|${cornerIdx}|${axis}|${idx}`;
+    const LAST = CORNER_N - 1;
+    // Bucket diamond cells by (faceReal, cornerIdx).
+    const byCorner = new Map();
+    const faces = new Set();
+    for (const p of pieces) {
+      if (p.userData.type !== 'diamond') continue;
+      faces.add(p.userData.faceReal);
+      const k = `${p.userData.faceReal}|${p.userData.cornerIdx}`;
+      if (!byCorner.has(k)) byCorner.set(k, []);
+      byCorner.get(k).push(p);
     }
-    for (const cell of diamonds) {
-      const ud = cell.userData;
-      const rU = rowKey(ud.faceReal, ud.cornerIdx, 'u', ud.cellU);
-      const rV = rowKey(ud.faceReal, ud.cornerIdx, 'v', ud.cellV);
-      if (!rowsById.has(rU)) rowsById.set(rU, { cells: [], edgePos: ud.rowEndI.clone() });
-      if (!rowsById.has(rV)) rowsById.set(rV, { cells: [], edgePos: ud.rowEndIm1.clone() });
-      rowsById.get(rU).cells.push(cell);
-      rowsById.get(rV).cells.push(cell);
-    }
-    // Chain rows across faces by spatial proximity of their edgePos.
-    const ids = [...rowsById.keys()];
-    const parent = new Map(ids.map(id => [id, id]));
-    const find = id => { while (parent.get(id) !== id) { parent.set(id, parent.get(parent.get(id))); id = parent.get(id); } return id; };
-    const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); };
-    const posKey = v => `${Math.round(v.x * 100)},${Math.round(v.y * 100)},${Math.round(v.z * 100)}`;
-    const byPos = new Map();
-    for (const id of ids) {
-      const k = posKey(rowsById.get(id).edgePos);
-      if (!byPos.has(k)) byPos.set(k, []);
-      byPos.get(k).push(id);
-    }
-    for (const list of byPos.values()) {
-      for (let i = 1; i < list.length; i++) union(list[0], list[i]);
-    }
-    // Assign extraFaces to each cell using the row chain's representative id.
-    for (const id of ids) {
-      const root = find(id);
-      const tag = `R:${root}`;
-      for (const cell of rowsById.get(id).cells) {
-        if (!cell.userData.extraFaces) cell.userData.extraFaces = [];
-        if (!cell.userData.extraFaces.includes(tag)) cell.userData.extraFaces.push(tag);
+    for (const face of faces) {
+      for (let i = 0; i < 5; i++) {
+        const boxA = byCorner.get(`${face}|${i}`) || [];
+        const boxB = byCorner.get(`${face}|${(i + 1) % 5}`) || [];
+        const rowCells = [];
+        for (const c of boxA) if (c.userData.cellV === LAST) rowCells.push(c); // box i along edge i
+        for (const c of boxB) if (c.userData.cellU === LAST) rowCells.push(c); // box i+1 along edge i
+        if (rowCells.length === 0) continue;
+        const tag = `R:${face}:${i}`;
+        for (const c of rowCells) {
+          if (!c.userData.extraFaces) c.userData.extraFaces = [];
+          if (!c.userData.extraFaces.includes(tag)) c.userData.extraFaces.push(tag);
+        }
       }
     }
   }
@@ -2891,7 +2882,7 @@ registerShape(makeTuttminxShape(), 'Sudoku Tuttminx');
 // registerShape(makeTeraminxShape(), 'Sudoku Megaminx'); // hidden (full Teraminx)
 registerShape(makeTeraminxShape({
   name: 'Sudoku Teraminx',
-  subtitle: '12 dodecahedral faces. The central pentagon AND all three edge strips of every stack are shrunk down and blocked off — only the 5 corner sudoku boxes per face (45 cells) are playable. Each row of 3 cells also chains across the face edge into the adjacent corner-box for a 6-cell row constraint.',
+  subtitle: '12 dodecahedral faces. The central pentagon AND all three edge strips of every stack are shrunk down and blocked off — only the 5 corner sudoku boxes per face (45 cells) are playable. Along each pentagon edge the two flanking corner boxes form a 6-cell straight line across the blocked strip — those 6 cells must also be distinct 1–9.',
   // Very small inner pentagon → the entire blocked center column (pentagon
   // + all three edge strips of every stack) is tiny, leaving the corner
   // diamonds to dominate the face.
