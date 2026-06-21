@@ -1,4 +1,4 @@
-# Sudoku Polyhedra
+# sudosudosudo
 
 Sudoku-style number puzzles mapped onto polyhedral twisty-puzzle cut patterns, rendered in Three.js.
 
